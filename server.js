@@ -26,6 +26,169 @@ const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET    || 'gcm-secret-change-me
 const POLYGON_API_KEY   = process.env.POLYGON_API_KEY   || '';
 const PORT              = process.env.PORT              || 3000;
 
+
+// ══════════════════════════════════════════════════════════════════════════
+//  QQQ KEY S/R LEVEL MAP  (from QQQ Key S/R Levels v2 indicator)
+//  Updated: March 2026
+//  Used to give AI precise nearest support/resistance context on every signal
+// ══════════════════════════════════════════════════════════════════════════
+const QQQ_SR = {
+  resistance: [
+    { price: 637.01, label: '52W HIGH',        major: true  },
+    { price: 635.77, label: 'Oct 29',           major: false },
+    { price: 632.92, label: '',                 major: false },
+    { price: 632.08, label: 'Nov 3',            major: false },
+    { price: 629.07, label: '',                 major: false },
+    { price: 628.09, label: '',                 major: false },
+    { price: 626.60, label: 'Nov 5',            major: false },
+    { price: 624.84, label: '',                 major: false },
+    { price: 623.28, label: '',                 major: false },
+    { price: 621.08, label: '',                 major: false },
+    { price: 618.42, label: '',                 major: false },
+    { price: 616.75, label: 'Feb 2026 Rejection', major: false },
+    { price: 615.00, label: 'Range Equilibrium', major: false },
+    { price: 613.18, label: 'Oct 10 High',      major: true  },
+    { price: 611.54, label: '',                 major: false },
+  ],
+  support: [
+    { price: 611.67, label: 'Nov 6',            major: false },
+    { price: 610.58, label: '',                 major: false },
+    { price: 609.74, label: 'Nov 7',            major: false },
+    { price: 608.40, label: 'Nov 13',           major: false },
+    { price: 607.71, label: '',                 major: false },
+    { price: 606.08, label: 'Nov 13 Low',       major: false },
+    { price: 605.49, label: '',                 major: false },
+    { price: 603.93, label: '',                 major: false },
+    { price: 603.25, label: '',                 major: false },
+    { price: 602.00, label: 'HTF Demand Zone',  major: true  },
+    { price: 600.37, label: '',                 major: false },
+    { price: 600.00, label: 'PSYCHOLOGICAL',    major: true  },
+    { price: 599.74, label: 'Oct 22 Low',       major: false },
+    { price: 598.73, label: '',                 major: false },
+    { price: 597.17, label: 'Nov 14 Low',       major: false },
+    { price: 596.10, label: '',                 major: false },
+    { price: 595.97, label: '',                 major: false },
+    { price: 595.50, label: 'Oct 16 Low',       major: false },
+    { price: 593.53, label: 'Volume Support',   major: true  },
+    { price: 591.18, label: '',                 major: false },
+    { price: 590.13, label: 'Oct 14 Low',       major: false },
+    { price: 590.00, label: '',                 major: false },
+    { price: 589.50, label: 'Oct 10 LOW - Major', major: true },
+    { price: 589.05, label: 'Oct 10 Intraday',  major: false },
+    { price: 586.66, label: '',                 major: false },
+    { price: 584.37, label: 'Sep 17 Low',       major: false },
+    { price: 584.08, label: '',                 major: false },
+    { price: 582.00, label: 'Range Low',        major: false },
+    { price: 580.70, label: '',                 major: false },
+    { price: 578.87, label: '',                 major: false },
+    { price: 578.55, label: 'Sep 10 Low',       major: false },
+    { price: 577.08, label: '',                 major: false },
+    { price: 576.06, label: '',                 major: false },
+    { price: 575.23, label: '',                 major: false },
+    { price: 572.61, label: 'Aug Low',          major: false },
+    { price: 571.53, label: 'Sep 5 LOW - Major', major: true },
+    { price: 565.62, label: '',                 major: false },
+    { price: 550.00, label: 'Psychological',    major: false },
+    { price: 540.81, label: 'Feb 25 ATH→Support', major: true },
+    { price: 520.00, label: 'Dec 24',           major: false },
+    { price: 511.23, label: 'Jan 2 25 Open',    major: false },
+    { price: 500.00, label: 'PSYCHOLOGICAL',    major: true  },
+    { price: 490.91, label: 'May Rally Top',    major: false },
+    { price: 488.00, label: '61.8% Fib',        major: false },
+    { price: 487.18, label: 'May Wave',         major: false },
+    { price: 478.12, label: '',                 major: false },
+    { price: 476.78, label: '',                 major: false },
+    { price: 474.81, label: '',                 major: false },
+    { price: 468.41, label: '',                 major: false },
+    { price: 467.00, label: 'Mar Low',          major: false },
+    { price: 462.43, label: '',                 major: false },
+    { price: 450.00, label: 'Psychological',    major: false },
+    { price: 443.14, label: 'Wave 1 Top',       major: false },
+    { price: 428.00, label: 'Pivot/Wave 2',     major: false },
+  ],
+  critical: [
+    { price: 404.44, label: 'Apr 9',            major: false },
+    { price: 402.39, label: '52W LOW - Apr 7',  major: true  },
+  ],
+  // Cluster zones — price inside these = sandwiched between institutional levels
+  zones: [
+    { top: 637.01, bot: 635.77, type: 'resistance', label: '52W High cluster' },
+    { top: 632.92, bot: 632.08, type: 'resistance', label: 'Nov 3 resistance cluster' },
+    { top: 629.07, bot: 628.09, type: 'resistance', label: 'Resistance cluster' },
+    { top: 616.75, bot: 615.00, type: 'resistance', label: 'Feb rejection / range equilibrium' },
+    { top: 613.18, bot: 611.54, type: 'resistance', label: 'Oct High cluster' },
+    { top: 611.67, bot: 610.58, type: 'support',    label: 'Nov 6 support cluster' },
+    { top: 607.71, bot: 606.08, type: 'support',    label: 'Nov 13 support cluster' },
+    { top: 602.00, bot: 600.00, type: 'support',    label: 'HTF Demand / Psychological $600' },
+    { top: 597.17, bot: 595.50, type: 'support',    label: 'Nov 14–Oct 16 support cluster' },
+    { top: 590.13, bot: 589.05, type: 'support',    label: 'Oct 14–10 Low cluster' },
+    { top: 584.37, bot: 584.08, type: 'support',    label: 'Sep 17 support cluster' },
+    { top: 578.87, bot: 578.55, type: 'support',    label: 'Sep 10 support cluster' },
+    { top: 576.06, bot: 575.23, type: 'support',    label: 'Support cluster' },
+  ]
+};
+
+// Compute nearest S/R levels for a given price
+function getQQQContext(price) {
+  const p = parseFloat(price);
+  if (!p) return null;
+
+  // Find nearest resistance above
+  const resistAbove = QQQ_SR.resistance
+    .filter(r => r.price > p)
+    .sort((a,b) => a.price - b.price);
+
+  // Find nearest support below
+  const supportBelow = QQQ_SR.support
+    .concat(QQQ_SR.critical)
+    .filter(s => s.price < p)
+    .sort((a,b) => b.price - a.price);
+
+  const nearR = resistAbove[0] || null;
+  const nearS = supportBelow[0] || null;
+  const nextR = resistAbove[1] || null;
+  const nextS = supportBelow[1] || null;
+
+  // Find next major levels
+  const majorR = resistAbove.find(r => r.major) || nearR;
+  const majorS = supportBelow.find(s => s.major) || nearS;
+
+  // Check if price is inside a cluster zone
+  const inZone = QQQ_SR.zones.find(z => p >= z.bot && p <= z.top) || null;
+
+  // Check if price is inside a cluster of minor levels (within $2)
+  const nearbyR = resistAbove.filter(r => r.price - p < 2.0);
+  const nearbyS = supportBelow.filter(s => p - s.price < 2.0);
+  const clustered = (nearbyR.length > 1 || nearbyS.length > 1);
+
+  const distToR = nearR ? (nearR.price - p).toFixed(2) : 'N/A';
+  const distToS = nearS ? (p - nearS.price).toFixed(2) : 'N/A';
+  const rsRatio = (nearR && nearS)
+    ? ((nearR.price - p) / (p - nearS.price)).toFixed(2)
+    : 'N/A';
+
+  // Risk/reward context
+  const rrContext = rsRatio !== 'N/A'
+    ? parseFloat(rsRatio) < 0.5  ? 'Price much closer to resistance — unfavorable R/R for longs'
+    : parseFloat(rsRatio) < 0.8  ? 'Resistance nearby — tight room to run for longs'
+    : parseFloat(rsRatio) < 1.2  ? 'Balanced — equal distance to resistance and support'
+    : parseFloat(rsRatio) < 2.0  ? 'Good room to run — resistance well above support'
+    : 'Excellent R/R — price near support with significant room above'
+    : 'N/A';
+
+  return {
+    nearR, nearS, nextR, nextS, majorR, majorS,
+    distToR, distToS, rsRatio, rrContext,
+    inZone, clustered, nearbyR, nearbyS,
+    // Formatted strings for prompt
+    nearRStr:  nearR ? `$${nearR.price} ${nearR.label ? '('+nearR.label+')' : ''} — ${distToR} pts away` : 'None identified',
+    nearSStr:  nearS ? `$${nearS.price} ${nearS.label ? '('+nearS.label+')' : ''} — ${distToS} pts away` : 'None identified',
+    majorRStr: majorR ? `$${majorR.price} (${majorR.label || 'Major resistance'})` : 'None identified',
+    majorSStr: majorS ? `$${majorS.price} (${majorS.label || 'Major support'})` : 'None identified',
+    zoneStr:   inZone ? `⚠ PRICE INSIDE CLUSTER ZONE: ${inZone.label} ($${inZone.bot}–$${inZone.top})` : null,
+  };
+}
+
 // ── SSE broadcast ──────────────────────────────────────────────────────────
 const clients = new Set();
 function broadcast(data) {
@@ -351,6 +514,34 @@ ASSET CONTEXT — Equity/ETF:
 - VWAP is the primary institutional benchmark.
 `;
 
+  // Compute QQQ S/R context if applicable
+  const srCtx = isQQQ ? getQQQContext(price) : null;
+
+  // S/R section for prompt
+  const srSection = srCtx ? `
+╔═══════════════════════════════════════╗
+  QQQ KEY S/R LEVELS (Live Map)
+╚═══════════════════════════════════════╝
+Signal Price:      $${price}
+${srCtx.zoneStr ? srCtx.zoneStr : '✓ Price not inside a cluster zone'}
+
+NEAREST LEVELS:
+Resistance Above:  ${srCtx.nearRStr}
+Support Below:     ${srCtx.nearSStr}
+Next Resistance:   ${srCtx.nextR ? '$' + srCtx.nextR.price + ' (' + (srCtx.nextR.label||'') + ')' : 'N/A'}
+Next Support:      ${srCtx.nextS ? '$' + srCtx.nextS.price + ' (' + (srCtx.nextS.label||'') + ')' : 'N/A'}
+
+MAJOR LEVELS:
+Major Resistance:  ${srCtx.majorRStr}
+Major Support:     ${srCtx.majorSStr}
+
+RISK/REWARD:
+Dist to Resistance: $${srCtx.distToR}
+Dist to Support:    $${srCtx.distToS}
+R/S Ratio:          ${srCtx.rsRatio} → ${srCtx.rrContext}
+${srCtx.clustered ? '⚠ PRICE IN DENSE CLUSTER — multiple levels within $2, choppy price action likely' : ''}
+` : '';
+
   const prompt = `You are a triple-engine trading analyst specializing in ${assetType}. A signal just fired from the GCM Heikin Ashi RSI Trend Cloud strategy. Run all three frameworks then deliver a final verdict.
 ${assetContext}
 
@@ -375,6 +566,7 @@ ${isStrategy ? '✅ Strategy-grade signal: HTF confirmation + momentum filter + 
 Confluence ${quality.breakdown.confluence.score}/35 | RSI ${quality.breakdown.rsiStrength.score}/25 | Divergence ${quality.breakdown.divergence.score}/20 | Timeframe ${quality.breakdown.timeframe.score}/20
 ${quality.divOpposes ? '⚠ DIVERGENCE OPPOSES SIGNAL' : ''}
 ${marketSection}
+${srSection}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FRAMEWORK A — HRTC SIGNAL EVALUATION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -394,9 +586,9 @@ The indicator already tagged this signal as: "${liquidity || context}"
 Use that as context alongside your own analysis.
 
 THE TAPE:
-1. ABSORPTION ZONE: Nearest psychological level to $${price}? Approaching, at, or extended?
-2. VALUE BUYERS/SELLERS: Is $${price} at value or is this a chase entry?
-3. THE RISK: What stop-hunt or liquidity trap could occur before the real move?
+1. ABSORPTION ZONE: The nearest resistance is ${srCtx ? srCtx.nearRStr : 'unknown'} and nearest support is ${srCtx ? srCtx.nearSStr : 'unknown'}. Is the signal price approaching, sitting at, or extended from these institutional clusters? ${srCtx?.zoneStr ? 'NOTE: ' + srCtx.zoneStr : ''}
+2. VALUE BUYERS/SELLERS: With the R/S ratio of ${srCtx ? srCtx.rsRatio : 'N/A'} (${srCtx ? srCtx.rrContext : 'N/A'}), is $${price} at value or is this a chase entry into resistance?
+3. THE RISK: Given the level map above, what specific stop-hunt or liquidity trap is most likely before the real move? Name the specific price level institutions would target.
 
 LIQUIDITY VERDICT: [BUY / SELL / HOLD — one sentence]
 
