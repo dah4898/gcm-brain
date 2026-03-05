@@ -324,7 +324,35 @@ Largest Trade:  ${trades.largestTrade}
 ${trades.blockContext}` : ''}
 ` : `Market data unavailable${marketData?.error ? ': ' + marketData.error : ''}`;
 
-  const prompt = `You are a triple-engine trading analyst for BTCUSD. A signal just fired from the GCM Heikin Ashi RSI Trend Cloud strategy. Run all three frameworks then deliver a final verdict.
+  // Detect asset type for QQQ-specific reasoning
+  const isQQQ    = (ticker||'').toUpperCase() === 'QQQ' || (ticker||'').toUpperCase().includes('QQQ');
+  const isCrypto = ['BTC','ETH','SOL','XRP'].some(c => (ticker||'').toUpperCase().includes(c));
+  const assetType = isQQQ ? 'QQQ (Nasdaq-100 ETF)' : isCrypto ? 'Crypto' : 'Equity/ETF';
+
+  const assetContext = isQQQ ? `
+ASSET CONTEXT — QQQ (Nasdaq-100 ETF):
+- Market hours 9:30am–4:00pm EST only. Best signals in opening hour and power hour (3–4pm).
+- Avoid the 12:00–2:00pm dead zone — thin liquidity, unreliable reversals.
+- Key psychological levels are whole dollars ($480, $485, $490, $500) and half dollars ($482.50 etc).
+- VWAP is the primary institutional execution benchmark for QQQ. Above VWAP = bull bias, below = bear bias.
+- Dark pool block prints on QQQ are highly significant — large ETF blocks often precede moves by 15–30 min.
+- QQQ options create gamma walls at round dollar strikes. These act as magnets AND hard resistance/support.
+- SPY/QQQ correlation is tight — a signal conflicting with SPY macro direction is lower conviction.
+- Opening range breakout (first 30 min high/low) is a key institutional reference level for the session.
+` : isCrypto ? `
+ASSET CONTEXT — Crypto (24/7 market):
+- No market hours — low-liquidity overnight sessions produce unreliable signals.
+- Key psychological levels are large round numbers ($100K, $95K, $90K for BTC).
+- Block trade data not available via Polygon for crypto.
+` : `
+ASSET CONTEXT — Equity/ETF:
+- Market hours 9:30am–4:00pm EST.
+- Respect whole dollar and 50-cent psychological levels.
+- VWAP is the primary institutional benchmark.
+`;
+
+  const prompt = `You are a triple-engine trading analyst specializing in ${assetType}. A signal just fired from the GCM Heikin Ashi RSI Trend Cloud strategy. Run all three frameworks then deliver a final verdict.
+${assetContext}
 
 ╔═══════════════════════════════════════╗
   SIGNAL INPUT
@@ -387,7 +415,7 @@ Using Polygon live data:
    ${snap?.vwapContext ? '→ ' + snap.vwapContext : '→ N/A'}
 
 4. DARK POOL PROXY: Block trade evidence?
-   ${trades?.blockContext ? '→ ' + trades.blockContext : '→ Crypto: block trade scan not available'}
+   ${trades?.blockContext ? '→ ' + trades.blockContext : isQQQ ? '→ No block trades detected in last 50 trades' : '→ Block trade scan not available for crypto'}
 
 MICROSTRUCTURE VERDICT: [CONFIRMS / CONFLICTS / NEUTRAL]
 
