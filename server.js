@@ -1,14 +1,17 @@
 /**
- * GCM HRTC AI Brain — Triple Engine Server v4
+ * GCM HRTC AI Brain — Triple Engine Server v5
+ *
+ * Updated for GCM Heikin Ashi RSI Trend Cloud [QQQ] strategy webhook format
+ * Webhook fields: action, ticker, price, high, low, volume, context, liquidity
  *
  * Engine 1 — HRTC Signal Quality Scorer (0–100)
- * Engine 2 — Liquidity Sandwich Order Flow
+ * Engine 2 — Liquidity Sandwich + built-in liquidity context from indicator
  * Engine 3 — Polygon.io Live Market Data
- *   → Volume vs average (Liquidity Vacuum detection)
+ *   → Volume conviction (bar volume vs Polygon daily volume)
  *   → Bid/ask spread (order book thinning)
  *   → VWAP positioning (institutional reference)
  *   → Block trade detection (dark pool proxy)
- *   → Pre/after market volume context
+ *   → Liquidity Vacuum detection
  */
 
 const express = require('express');
@@ -34,23 +37,51 @@ function broadcast(data) {
 const signalHistory = [];
 
 // ══════════════════════════════════════════════════════════════════════════
-//  ENGINE 3 — POLYGON.IO LIVE MARKET DATA FETCHER
+//  NORMALISE WEBHOOK — handle both old and new indicator formats
+// ══════════════════════════════════════════════════════════════════════════
+function normalisePayload(body) {
+  // New format from GCM HRTC Strategy
+  if (body.action) {
+    const isBull = body.action === 'buy';
+    const isBear = body.action === 'sell';
+    return {
+      ticker:       body.ticker,
+      timeframe:    body.timeframe || '—',
+      price:        parseFloat(body.price),
+      high:         parseFloat(body.high)   || null,
+      low:          parseFloat(body.low)    || null,
+      barVolume:    parseFloat(body.volume) || null,
+      action:       body.action,
+      context:      body.context   || '',
+      liquidity:    body.liquidity || '',
+      // Map to internal signal format
+      harsi_candle: isBull ? 'bullish' : 'bearish',
+      harsi_prev:   isBull ? 'bearish' : 'bullish',
+      rsi_now:      isBull ? 4  : -4,
+      rsi_prev:     isBull ? -2 : 2,
+      divergence:   'none',
+      isClose:      body.action === 'close',
+      format:       'v5'
+    };
+  }
+  // Legacy format — pass through unchanged
+  return { ...body, format: 'legacy' };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  ENGINE 3 — POLYGON.IO LIVE MARKET DATA
 // ══════════════════════════════════════════════════════════════════════════
 async function fetchPolygonData(ticker) {
-  // Clean ticker — remove /USD, /USDT etc for stocks, keep as-is for crypto
-  const isForex  = ticker.includes('/') && !ticker.includes('USD');
-  const isCrypto = ticker.includes('BTC') || ticker.includes('ETH') ||
-                   ticker.includes('SOL') || ticker.includes('XRP') ||
-                   ticker.toUpperCase().endsWith('USD') || ticker.includes('/');
+  const isCrypto = ['BTC','ETH','SOL','XRP','BNB','DOGE','ADA'].some(c => ticker.includes(c))
+                || ticker.includes('/');
 
-  // Normalise ticker for Polygon
-  let polyTicker = ticker.replace('/', '').replace('-', '').toUpperCase();
+  let polyTicker = ticker.replace('/', '').replace('-','').toUpperCase();
   if (isCrypto) polyTicker = 'X:' + polyTicker.replace('USDT','USD');
 
   const results = {};
 
   try {
-    // ── 1. Snapshot (last trade, bid/ask, today's volume) ──────────────────
+    // Snapshot
     const snapUrl = isCrypto
       ? `https://api.polygon.io/v2/snapshot/locale/global/markets/crypto/tickers/${polyTicker}?apiKey=${POLYGON_API_KEY}`
       : `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${polyTicker}?apiKey=${POLYGON_API_KEY}`;
@@ -60,105 +91,88 @@ async function fetchPolygonData(ticker) {
     const snap     = snapData?.ticker || snapData?.results?.[0] || null;
 
     if (snap) {
-      const day  = snap.day  || {};
+      const day  = snap.day     || {};
       const prev = snap.prevDay || {};
-      const last = snap.lastTrade || snap.lastQuote || {};
-      const min  = snap.min || {};
 
-      // Volume analysis
-      const todayVol   = day.v  || 0;
-      const prevVol    = prev.v || 0;
-      const volRatio   = prevVol > 0 ? (todayVol / prevVol) : null;
+      const todayVol = day.v  || 0;
+      const prevVol  = prev.v || 0;
+      const volRatio = prevVol > 0 ? todayVol / prevVol : null;
       const volContext = volRatio === null ? 'N/A'
-        : volRatio < 0.3  ? 'VERY LOW (liquidity vacuum risk)'
-        : volRatio < 0.6  ? 'LOW (thin market)'
+        : volRatio < 0.3  ? 'VERY LOW — strong liquidity vacuum risk'
+        : volRatio < 0.6  ? 'LOW — thin market, move may not sustain'
         : volRatio < 0.9  ? 'BELOW AVERAGE'
         : volRatio < 1.2  ? 'AVERAGE'
-        : volRatio < 2.0  ? 'ABOVE AVERAGE'
-        : 'HIGH VOLUME (institutional activity likely)';
+        : volRatio < 2.0  ? 'ABOVE AVERAGE — conviction present'
+        : 'HIGH — institutional activity likely';
 
-      // Bid/ask spread analysis
       const bid    = snap.lastQuote?.P || snap.lastQuote?.bp || 0;
       const ask    = snap.lastQuote?.p || snap.lastQuote?.ap || 0;
       const spread = (bid && ask) ? ((ask - bid) / bid * 100).toFixed(4) : null;
       const spreadContext = !spread ? 'N/A'
-        : parseFloat(spread) > 0.1  ? 'WIDE — order book thinning, low liquidity'
-        : parseFloat(spread) > 0.05 ? 'MODERATE — normal market conditions'
-        : 'TIGHT — deep order book, good liquidity';
+        : parseFloat(spread) > 0.1  ? 'WIDE — order book thinning, low depth'
+        : parseFloat(spread) > 0.05 ? 'MODERATE — normal conditions'
+        : 'TIGHT — deep order book, healthy liquidity';
 
-      // VWAP positioning
-      const vwap     = day.vw || null;
-      const lastPrice = snap.lastTrade?.p || snap.day?.c || null;
+      const vwap      = day.vw || null;
+      const lastPrice = snap.lastTrade?.p || day.c || null;
       const vwapContext = (!vwap || !lastPrice) ? 'N/A'
-        : lastPrice > vwap * 1.005 ? `ABOVE VWAP ($${vwap?.toFixed(2)}) — bullish institutional bias`
-        : lastPrice < vwap * 0.995 ? `BELOW VWAP ($${vwap?.toFixed(2)}) — bearish institutional bias`
-        : `AT VWAP ($${vwap?.toFixed(2)}) — decision zone`;
+        : lastPrice > vwap * 1.005 ? `ABOVE VWAP $${vwap?.toFixed(2)} — bullish institutional bias`
+        : lastPrice < vwap * 0.995 ? `BELOW VWAP $${vwap?.toFixed(2)} — bearish institutional bias`
+        : `AT VWAP $${vwap?.toFixed(2)} — key decision zone`;
 
-      // Price change context
-      const priceChange = (lastPrice && prev.c) ? ((lastPrice - prev.c) / prev.c * 100).toFixed(2) : null;
+      const priceChange = (lastPrice && prev.c)
+        ? ((lastPrice - prev.c) / prev.c * 100).toFixed(2) : null;
 
-      // Liquidity Vacuum detection: price moving but volume low
-      const liqVacuum = (volRatio !== null && volRatio < 0.5 && priceChange && Math.abs(parseFloat(priceChange)) > 0.5)
-        ? `⚠ LIQUIDITY VACUUM DETECTED — price moved ${priceChange}% on only ${(volRatio*100).toFixed(0)}% of normal volume. Move may not be sustained.`
+      const liqVacuum = (volRatio !== null && volRatio < 0.5
+        && priceChange && Math.abs(parseFloat(priceChange)) > 0.5)
+        ? `⚠ LIQUIDITY VACUUM — price moved ${priceChange}% on ${(volRatio*100).toFixed(0)}% of normal volume`
         : null;
 
       results.snapshot = {
-        lastPrice,
-        todayVol:      todayVol.toLocaleString(),
-        prevVol:       prevVol.toLocaleString(),
-        volRatio:      volRatio ? (volRatio * 100).toFixed(0) + '% of yesterday' : 'N/A',
-        volContext,
-        bid:           bid || 'N/A',
-        ask:           ask || 'N/A',
-        spread:        spread ? spread + '%' : 'N/A',
-        spreadContext,
-        vwap:          vwap?.toFixed(2) || 'N/A',
-        vwapContext,
-        priceChange:   priceChange ? priceChange + '%' : 'N/A',
+        lastPrice, vwap: vwap?.toFixed(2),
+        todayVol: todayVol.toLocaleString(),
+        prevVol:  prevVol.toLocaleString(),
+        volRatio: volRatio ? (volRatio*100).toFixed(0)+'% of yesterday' : 'N/A',
+        volContext, spreadContext, vwapContext,
+        spread: spread ? spread+'%' : 'N/A',
+        bid: bid || 'N/A', ask: ask || 'N/A',
+        priceChange: priceChange ? priceChange+'%' : 'N/A',
+        open:  day.o?.toFixed(2) || 'N/A',
+        high:  day.h?.toFixed(2) || 'N/A',
+        low:   day.l?.toFixed(2) || 'N/A',
         liqVacuum,
-        open:          day.o?.toFixed(2) || 'N/A',
-        high:          day.h?.toFixed(2) || 'N/A',
-        low:           day.l?.toFixed(2) || 'N/A',
       };
+
+      results.gapContext = priceChange
+        ? parseFloat(priceChange) > 2  ? `GAP UP ${priceChange}% — institutions may fade`
+        : parseFloat(priceChange) < -2 ? `GAP DOWN ${priceChange}% — watch for support`
+        : `No significant gap (${priceChange}%)`
+        : null;
     }
 
-    // ── 2. Recent trades — block trade / dark pool proxy ──────────────────
-    // Large single trades relative to average = institutional block proxy
+    // Block trade scan (stocks only)
     if (!isCrypto) {
-      const tradesUrl = `https://api.polygon.io/v3/trades/${polyTicker}?limit=50&apiKey=${POLYGON_API_KEY}`;
-      const tradesRes  = await fetch(tradesUrl);
-      const tradesData = await tradesRes.json();
-      const trades     = tradesData?.results || [];
-
+      const tRes  = await fetch(`https://api.polygon.io/v3/trades/${polyTicker}?limit=50&apiKey=${POLYGON_API_KEY}`);
+      const tData = await tRes.json();
+      const trades = tData?.results || [];
       if (trades.length > 0) {
-        const sizes     = trades.map(t => t.size || 0);
-        const avgSize   = sizes.reduce((a, b) => a + b, 0) / sizes.length;
-        const maxSize   = Math.max(...sizes);
-        const blockTrades = trades.filter(t => (t.size || 0) > avgSize * 5);
-
+        const sizes  = trades.map(t => t.size || 0);
+        const avg    = sizes.reduce((a,b) => a+b, 0) / sizes.length;
+        const blocks = trades.filter(t => (t.size||0) > avg * 5);
         results.trades = {
-          avgTradeSize:   Math.round(avgSize).toLocaleString(),
-          largestTrade:   maxSize.toLocaleString(),
-          blockTradeCount: blockTrades.length,
-          blockContext:   blockTrades.length > 3
-            ? `⚠ ${blockTrades.length} BLOCK TRADES detected (5x+ avg size) — institutional activity likely`
-            : blockTrades.length > 0
-            ? `${blockTrades.length} large trade(s) detected — monitor for accumulation/distribution`
-            : 'No significant block trades in last 50 trades — retail flow dominant',
+          avgTradeSize:    Math.round(avg).toLocaleString(),
+          largestTrade:    Math.max(...sizes).toLocaleString(),
+          blockTradeCount: blocks.length,
+          blockContext: blocks.length > 3
+            ? `⚠ ${blocks.length} BLOCK TRADES detected — institutional activity`
+            : blocks.length > 0
+            ? `${blocks.length} large trade(s) — monitor for accumulation/distribution`
+            : 'No significant block trades — retail flow dominant',
         };
       }
     }
-
-    // ── 3. Previous close + gap context ───────────────────────────────────
-    if (results.snapshot?.priceChange) {
-      const pct = parseFloat(results.snapshot.priceChange);
-      results.gapContext = pct > 2  ? `GAP UP ${pct}% — institutions may fade this`
-        : pct < -2 ? `GAP DOWN ${pct}% — watch for institutional support`
-        : `No significant gap (${pct}%)`;
-    }
-
   } catch (err) {
-    console.warn(`[Polygon] Failed for ${ticker}:`, err.message);
+    console.warn(`[Polygon] ${ticker}:`, err.message);
     results.error = err.message;
   }
 
@@ -168,7 +182,12 @@ async function fetchPolygonData(ticker) {
 // ══════════════════════════════════════════════════════════════════════════
 //  ENGINE 1A — HRTC SIGNAL LOGIC
 // ══════════════════════════════════════════════════════════════════════════
-function computeSignals({ rsi_now, rsi_prev, harsi_candle, harsi_prev, divergence }) {
+function computeSignals({ rsi_now, rsi_prev, harsi_candle, harsi_prev, divergence, action }) {
+  // If we have a direct action from the strategy, trust it
+  if (action === 'buy')   return { rsiRising:true,  rsiBull:true,  rsiBear:false, harsiBull:true,  harsiBear:false, overallBull:true,  overallBear:false };
+  if (action === 'sell')  return { rsiRising:false, rsiBull:false, rsiBear:true,  harsiBull:false, harsiBear:true,  overallBull:false, overallBear:true  };
+  if (action === 'close') return { rsiRising:false, rsiBull:false, rsiBear:false, harsiBull:false, harsiBear:false, overallBull:false, overallBear:false, isClose:true };
+
   const rsiRising    = parseFloat(rsi_now)  >= parseFloat(rsi_prev);
   const prevPositive = parseFloat(rsi_prev) >= 0;
   const rsiBull      = rsiRising  && !prevPositive;
@@ -182,28 +201,37 @@ function computeSignals({ rsi_now, rsi_prev, harsi_candle, harsi_prev, divergenc
 
 // ══════════════════════════════════════════════════════════════════════════
 //  ENGINE 1B — SIGNAL QUALITY SCORER (0–100)
+//  Strategy signals get a base quality boost since they've already passed
+//  HTF filter, momentum filter, and OB/OS filter before firing
 // ══════════════════════════════════════════════════════════════════════════
-function scoreSignal({ rsi_now, rsi_prev, harsi_candle, harsi_prev, divergence, timeframe, signals }) {
+function scoreSignal({ rsi_now, rsi_prev, divergence, timeframe, signals, format }) {
   const rsiVal = parseFloat(rsi_now);
   const rsiAbs = Math.abs(rsiVal);
   const isBull = signals.overallBull;
   const breakdown = {};
 
+  // Confluence — strategy signals get full confluence since filters already passed
   let conf = 0;
-  const harsiFlip = signals.harsiBull || signals.harsiBear;
-  const rsiFlip   = signals.rsiBull   || signals.rsiBear;
-  const dirMatch  = (isBull && signals.rsiRising) || (!isBull && !signals.rsiRising);
-  if (harsiFlip)            conf += 15;
-  if (rsiFlip)              conf += 10;
-  if (dirMatch)             conf += 5;
-  if (harsiFlip && rsiFlip) conf += 5;
+  const isStrategy = format === 'v5';
+  if (isStrategy) {
+    conf = 35; // HTF confirmed + momentum filtered + signal fired = full confluence
+  } else {
+    const harsiFlip = signals.harsiBull || signals.harsiBear;
+    const rsiFlip   = signals.rsiBull   || signals.rsiBear;
+    const dirMatch  = (isBull && signals.rsiRising) || (!isBull && !signals.rsiRising);
+    if (harsiFlip)            conf += 15;
+    if (rsiFlip)              conf += 10;
+    if (dirMatch)             conf += 5;
+    if (harsiFlip && rsiFlip) conf += 5;
+  }
   breakdown.confluence = { score: conf, max: 35,
-    items: [
-      { label: 'HARSI candle flip',       pts: harsiFlip ? 15 : 0, hit: harsiFlip },
-      { label: 'RSI zero-cross flip',     pts: rsiFlip   ? 10 : 0, hit: rsiFlip   },
-      { label: 'RSI direction aligned',   pts: dirMatch  ? 5  : 0, hit: dirMatch  },
-      { label: 'Dual confirmation bonus', pts: (harsiFlip && rsiFlip) ? 5 : 0, hit: harsiFlip && rsiFlip },
-    ]
+    items: isStrategy
+      ? [{ label: 'Strategy signal: HTF + momentum + OB/OS filters passed', pts: 35, hit: true }]
+      : [
+          { label: 'HARSI candle flip',       pts: (signals.harsiBull||signals.harsiBear) ? 15 : 0, hit: signals.harsiBull||signals.harsiBear },
+          { label: 'RSI zero-cross flip',     pts: (signals.rsiBull||signals.rsiBear)     ? 10 : 0, hit: signals.rsiBull||signals.rsiBear     },
+          { label: 'RSI direction aligned',   pts: ((isBull&&signals.rsiRising)||(!isBull&&!signals.rsiRising)) ? 5 : 0, hit: true },
+        ]
   };
 
   let rsiPts = rsiAbs >= 25 ? 22 : rsiAbs >= 15 ? 17 : rsiAbs >= 5 ? 11 : 4;
@@ -222,11 +250,11 @@ function scoreSignal({ rsi_now, rsi_prev, harsi_candle, harsi_prev, divergence, 
   const divOpposes  = (divergence === 'bull' && !isBull) || (divergence === 'bear' && isBull);
   const divPts      = divConfirms ? 20 : 0;
   breakdown.divergence = { score: divPts, max: 20, warning: divOpposes,
-    items: [ !divergence || divergence === 'none'
+    items: [!divergence || divergence === 'none'
       ? { label: 'No divergence', pts: 0, hit: false }
       : divConfirms
-        ? { label: `${divergence} div confirms signal`, pts: 20, hit: true }
-        : { label: `${divergence} div OPPOSES signal ⚠`, pts: 0, hit: false, warn: true }
+        ? { label: `${divergence} div confirms`, pts: 20, hit: true }
+        : { label: `${divergence} div OPPOSES ⚠`, pts: 0, hit: false, warn: true }
     ]
   };
 
@@ -235,7 +263,7 @@ function scoreSignal({ rsi_now, rsi_prev, harsi_candle, harsi_prev, divergence, 
     '45m':15,'1H':16,'2H':17,'3H':17,'4H':18,'6H':18,
     '8H':19,'12H':19,'1D':20,'3D':20,'1W':20,'1M':20
   };
-  const tf    = (timeframe || '').replace('min','m').replace('hour','H').replace('day','D');
+  const tf    = (timeframe||'').replace('min','m').replace('hour','H').replace('day','D');
   const tfPts = tfMap[tf] || tfMap[timeframe] || 10;
   const tfLbl = tfPts >= 18 ? 'High (daily+)' : tfPts >= 14 ? 'Medium-High' : tfPts >= 10 ? 'Medium' : 'Low (noisy)';
   breakdown.timeframe = { score: tfPts, max: 20,
@@ -250,39 +278,39 @@ function scoreSignal({ rsi_now, rsi_prev, harsi_candle, harsi_prev, divergence, 
 
 // ══════════════════════════════════════════════════════════════════════════
 //  ENGINE 2 — TRIPLE-BRAIN AI PROMPT
-//  Framework A: HRTC signal evaluation
-//  Framework B: Liquidity Sandwich
-//  Framework C: Polygon live market data (volume, spread, VWAP, blocks)
-//  Final:       Cross-referenced ACTIONABLE / WAIT / AVOID
 // ══════════════════════════════════════════════════════════════════════════
 async function runTripleBrainAnalysis(payload, signals, quality, marketData) {
-  const { ticker, timeframe, price, rsi_now, rsi_prev,
-          harsi_candle, harsi_prev, divergence, context } = payload;
-  const isBull = signals.overallBull;
-  const action = isBull ? 'BUY' : 'SELL';
-  const rsiStd = (parseFloat(rsi_now) + 50).toFixed(1);
+  const { ticker, timeframe, price, high, low, barVolume,
+          rsi_now, rsi_prev, divergence, context, liquidity,
+          action, format } = payload;
 
-  const activeSignals = [
-    signals.harsiBull ? 'HARSI Bull flip (primary)'  : '',
-    signals.harsiBear ? 'HARSI Bear flip (primary)'  : '',
-    signals.rsiBull   ? 'Fast Bull — RSI zero-cross' : '',
-    signals.rsiBear   ? 'Fast Bear — RSI zero-cross' : '',
-  ].filter(Boolean).join(', ') || 'Momentum continuation';
+  const isBull     = signals.overallBull;
+  const isClose    = action === 'close';
+  const actionLabel = isClose ? 'EXIT/CLOSE' : isBull ? 'BUY' : 'SELL';
+  const rsiStd     = (parseFloat(rsi_now) + 50).toFixed(1);
+  const isStrategy = format === 'v5';
+  const snap       = marketData?.snapshot;
+  const trades     = marketData?.trades;
 
-  // Format Polygon data for prompt
-  const snap   = marketData?.snapshot;
-  const trades = marketData?.trades;
+  // Bar range context
+  const barRange = (high && low) ? `$${low} – $${high} (range: $${(high-low).toFixed(2)})` : 'N/A';
+  const barVolCtx = barVolume
+    ? `${parseInt(barVolume).toLocaleString()} (this bar)`
+    : 'N/A';
+
   const marketSection = snap ? `
 ╔═══════════════════════════════════════╗
   LIVE MARKET DATA (Polygon.io)
 ╚═══════════════════════════════════════╝
-Price:          $${snap.lastPrice || price}
+Last Price:     $${snap.lastPrice || price}
 Today's Range:  $${snap.low} – $${snap.high}  |  Open: $${snap.open}
+Bar Range:      ${barRange}
+Bar Volume:     ${barVolCtx}
 Price Change:   ${snap.priceChange} vs yesterday  ${marketData.gapContext ? '→ ' + marketData.gapContext : ''}
 
-VOLUME ANALYSIS:
-Today's Volume: ${snap.todayVol} (${snap.volRatio})
-Volume Context: ${snap.volContext}
+VOLUME:
+Daily Volume:   ${snap.todayVol} (${snap.volRatio})
+Assessment:     ${snap.volContext}
 ${snap.liqVacuum ? snap.liqVacuum : '✓ No liquidity vacuum detected'}
 
 ORDER BOOK:
@@ -290,95 +318,92 @@ Bid/Ask Spread: ${snap.spread} — ${snap.spreadContext}
 
 VWAP:           ${snap.vwapContext}
 
-${trades ? `BLOCK TRADE ANALYSIS:
-Avg Trade Size: ${trades.avgTradeSize} shares
-Largest Trade:  ${trades.largestTrade} shares
+${trades ? `BLOCK TRADES (last 50):
+Avg Trade Size: ${trades.avgTradeSize}
+Largest Trade:  ${trades.largestTrade}
 ${trades.blockContext}` : ''}
-` : `
-╔═══════════════════════════════════════╗
-  LIVE MARKET DATA
-╚═══════════════════════════════════════╝
-${marketData?.error ? 'Polygon data unavailable: ' + marketData.error : 'No market data retrieved'}
-`;
+` : `Market data unavailable${marketData?.error ? ': ' + marketData.error : ''}`;
 
-  const prompt = `You are a triple-engine trading analyst. Run all three frameworks, then deliver a cross-referenced final verdict.
+  const prompt = `You are a triple-engine trading analyst for BTCUSD. A signal just fired from the GCM Heikin Ashi RSI Trend Cloud strategy. Run all three frameworks then deliver a final verdict.
 
 ╔═══════════════════════════════════════╗
   SIGNAL INPUT
 ╚═══════════════════════════════════════╝
-Ticker:     ${ticker}
-Action:     ${action}
-Price:      $${price || 'N/A'}
-Timeframe:  ${timeframe}
-RSI:        ${rsi_now} zero-centered (standard ~${rsiStd})
-Prev RSI:   ${rsi_prev}
-HARSI:      ${harsi_candle === 'bullish' ? '🟢 GREEN' : '🔴 RED'} (was: ${harsi_prev === 'bullish' ? '🟢 GREEN' : '🔴 RED'})
-Divergence: ${divergence || 'none'}
-Context:    ${context || 'Standard HRTC alert'}
-Signals:    ${activeSignals}
+Ticker:         ${ticker}
+Action:         ${actionLabel}
+Price:          $${price}
+Bar Range:      ${barRange}
+Bar Volume:     ${barVolCtx}
+Timeframe:      ${timeframe}
+RSI (0-centered): ${rsi_now} (std: ~${rsiStd})  |  Prev: ${rsi_prev}
+Divergence:     ${divergence || 'none'}
+Signal Context: ${context}
+Liquidity Tag:  ${liquidity || 'N/A'}
+${isStrategy ? '✅ Strategy-grade signal: HTF confirmation + momentum filter + OB/OS filter all passed before this fired' : ''}
 
 ╔═══════════════════════════════════════╗
-  QUALITY SCORE: ${quality.total}/100 — ${quality.tier} (Grade ${quality.grade})
+  QUALITY SCORE: ${quality.total}/100 — ${quality.tier} (${quality.grade})
 ╚═══════════════════════════════════════╝
-Confluence ${quality.breakdown.confluence.score}/35 | RSI Strength ${quality.breakdown.rsiStrength.score}/25 | Divergence ${quality.breakdown.divergence.score}/20 | Timeframe ${quality.breakdown.timeframe.score}/20
+Confluence ${quality.breakdown.confluence.score}/35 | RSI ${quality.breakdown.rsiStrength.score}/25 | Divergence ${quality.breakdown.divergence.score}/20 | Timeframe ${quality.breakdown.timeframe.score}/20
 ${quality.divOpposes ? '⚠ DIVERGENCE OPPOSES SIGNAL' : ''}
 ${marketSection}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FRAMEWORK A — HRTC SIGNAL EVALUATION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Evaluate the HRTC reading for this ${action}:
-- Is RSI momentum (${rsi_now} zero-centered) strong enough?
-- Does the HARSI flip carry conviction or is it a weak wiggle?
-- What does ${quality.total}/100 mean for position confidence?
+${isClose
+  ? `This is an EXIT signal. Evaluate whether closing the position now is the right call based on RSI momentum and current market structure.`
+  : `Evaluate this ${actionLabel} signal from the GCM HRTC strategy:
+- The strategy already passed HTF cloud confirmation, RSI momentum filter (min delta), and optional OB/OS zone filter
+- Is RSI momentum at ${rsi_now} zero-centered strong enough to trust this entry?
+- What does the quality score of ${quality.total}/100 say about conviction?`}
 
-HRTC VERDICT: [1–2 sentences referencing actual values]
+HRTC VERDICT: [1–2 sentences]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FRAMEWORK B — LIQUIDITY SANDWICH
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-You are an institutional Order Flow Analyst.
+The indicator already tagged this signal as: "${liquidity || context}"
+Use that as context alongside your own analysis.
 
 THE TAPE:
-1. ABSORPTION ZONE: Nearest psychological level to $${price}? Is price approaching, at, or extended from it?
-2. VALUE BUYERS/SELLERS: Is $${price} at value or extended/chasing?
-3. THE RISK: Why might institutions wait? What stop-hunt could occur first?
+1. ABSORPTION ZONE: Nearest psychological level to $${price}? Approaching, at, or extended?
+2. VALUE BUYERS/SELLERS: Is $${price} at value or is this a chase entry?
+3. THE RISK: What stop-hunt or liquidity trap could occur before the real move?
 
 LIQUIDITY VERDICT: [BUY / SELL / HOLD — one sentence]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FRAMEWORK C — MARKET MICROSTRUCTURE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Using the Polygon live data above, analyze:
+Using Polygon live data:
 
-1. VOLUME CONVICTION: Is this signal backed by real volume or a liquidity vacuum move?
-   ${snap?.liqVacuum ? '→ LIQUIDITY VACUUM ALREADY FLAGGED — price moved on thin volume' : '→ Assess volume vs historical context'}
+1. VOLUME CONVICTION: Is this move backed by real volume or a liquidity vacuum?
+   ${snap?.liqVacuum || '→ Assess volume context above'}
 
-2. ORDER BOOK HEALTH: What does the bid/ask spread tell us about market depth right now?
-   ${snap?.spreadContext ? '→ ' + snap.spreadContext : ''}
+2. ORDER BOOK HEALTH: Bid/ask spread signals?
+   ${snap?.spreadContext ? '→ ' + snap.spreadContext : '→ N/A'}
 
-3. INSTITUTIONAL POSITIONING: Is price above or below VWAP? What does that mean for smart money bias?
-   ${snap?.vwapContext ? '→ ' + snap.vwapContext : ''}
+3. VWAP BIAS: Institutional positioning?
+   ${snap?.vwapContext ? '→ ' + snap.vwapContext : '→ N/A'}
 
-4. DARK POOL PROXY: Based on block trade data, is there evidence of institutional accumulation or distribution?
-   ${trades?.blockContext ? '→ ' + trades.blockContext : '→ No block trade data available'}
+4. DARK POOL PROXY: Block trade evidence?
+   ${trades?.blockContext ? '→ ' + trades.blockContext : '→ Crypto: block trade scan not available'}
 
-MICROSTRUCTURE VERDICT: [CONFIRMS / CONFLICTS / NEUTRAL — one sentence]
+MICROSTRUCTURE VERDICT: [CONFIRMS / CONFLICTS / NEUTRAL]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FINAL CROSS-REFERENCED VERDICT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-All three frameworks must broadly agree for ACTIONABLE.
-
 DECISION: [ACTIONABLE / WAIT / AVOID]
-REASON: [One sentence — how do all three frameworks align or conflict?]
-ENTRY CONDITION: [Exact trigger — or "wait for X"]
+REASON: [One sentence — do all three frameworks agree?]
+ENTRY CONDITION: [Exact trigger or "enter now at market"]
 INVALIDATION: [What cancels this setup]
 POSITION SIZING: [FULL / REDUCED / SKIP]
 
 Rules:
 - ACTIONABLE → Score ≥65 AND liquidity aligns AND microstructure confirms AND no liq vacuum
-- WAIT       → Score 40–64 OR near absorption zone OR microstructure neutral OR low volume
-- AVOID      → Score <40 OR liq vacuum detected OR divergence opposes OR frameworks conflict`;
+- WAIT       → Score 40–64 OR near absorption zone OR microstructure neutral
+- AVOID      → Score <40 OR liq vacuum detected OR frameworks conflict`;
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -410,7 +435,7 @@ Rules:
 //  ROUTES
 // ══════════════════════════════════════════════════════════════════════════
 app.get('/', (req, res) =>
-  res.json({ status: 'GCM HRTC Triple Brain online', clients: clients.size, signals: signalHistory.length }));
+  res.json({ status: 'GCM HRTC Triple Brain v5 online', clients: clients.size, signals: signalHistory.length }));
 
 app.get('/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
@@ -426,39 +451,46 @@ app.get('/stream', (req, res) => {
 app.get('/history', (req, res) => res.json(signalHistory));
 
 app.post('/webhook', async (req, res) => {
-  const body = req.body;
+  const raw = req.body;
+
+  // Support both JSON body and plain string body (TradingView sometimes sends string)
+  let body = raw;
+  if (typeof raw === 'string') {
+    try { body = JSON.parse(raw); } catch (_) { return res.status(400).json({ error: 'Invalid JSON' }); }
+  }
+
   if (body.secret !== WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
 
-  console.log(`[Webhook] ${body.ticker} ${body.timeframe} @ $${body.price}`);
+  console.log(`[Webhook v5] ${body.ticker} ${body.action} @ $${body.price}`);
   res.json({ received: true });
 
   broadcast({ type: 'processing', ticker: body.ticker, timeframe: body.timeframe, ts: Date.now() });
 
   try {
-    // Run signal scoring and Polygon data fetch in parallel
-    const signals    = computeSignals(body);
-    const quality    = scoreSignal({ ...body, signals });
-    const marketData = await fetchPolygonData(body.ticker);
+    const payload    = normalisePayload(body);
+    const signals    = computeSignals(payload);
+    const quality    = scoreSignal({ ...payload, signals });
+    const marketData = await fetchPolygonData(payload.ticker);
 
-    console.log(`[Polygon] ${body.ticker} — Vol: ${marketData?.snapshot?.volRatio || 'N/A'} | Spread: ${marketData?.snapshot?.spread || 'N/A'} | VWAP: ${marketData?.snapshot?.vwap || 'N/A'}`);
+    console.log(`[Polygon] Vol: ${marketData?.snapshot?.volRatio||'N/A'} | Spread: ${marketData?.snapshot?.spread||'N/A'} | VWAP: ${marketData?.snapshot?.vwap||'N/A'}`);
 
-    const ai = await runTripleBrainAnalysis(body, signals, quality, marketData);
+    const ai = await runTripleBrainAnalysis(payload, signals, quality, marketData);
 
     const record = {
-      type: 'signal',
-      id: Date.now(),
-      ticker:       body.ticker     || '—',
-      timeframe:    body.timeframe  || '—',
-      price:        body.price      || null,
-      rsi_now:      parseFloat(body.rsi_now),
-      rsi_prev:     parseFloat(body.rsi_prev),
-      harsi_candle: body.harsi_candle,
-      harsi_prev:   body.harsi_prev,
-      divergence:   body.divergence || 'none',
-      context:      body.context    || '',
-      signals,
-      quality,
-      marketData,
+      type: 'signal', id: Date.now(),
+      ticker:    payload.ticker,
+      timeframe: payload.timeframe,
+      price:     payload.price,
+      high:      payload.high,
+      low:       payload.low,
+      barVolume: payload.barVolume,
+      action:    payload.action,
+      context:   payload.context,
+      liquidity: payload.liquidity,
+      rsi_now:   parseFloat(payload.rsi_now),
+      rsi_prev:  parseFloat(payload.rsi_prev),
+      divergence: payload.divergence,
+      signals, quality, marketData,
       analysis: ai.text,
       verdict:  ai.verdict,
       sizing:   ai.sizing,
@@ -469,11 +501,11 @@ app.post('/webhook', async (req, res) => {
     if (signalHistory.length > 50) signalHistory.pop();
     broadcast(record);
 
-    console.log(`[Done] ${body.ticker} | ${quality.total}/100 ${quality.tier} | ${ai.verdict} | ${ai.sizing}`);
+    console.log(`[Done] ${payload.ticker} ${payload.action} | ${quality.total}/100 ${quality.tier} | ${ai.verdict} | ${ai.sizing}`);
   } catch (err) {
     console.error('[Error]', err.message);
     broadcast({ type: 'error', message: err.message, ts: Date.now() });
   }
 });
 
-app.listen(PORT, () => console.log(`GCM HRTC Triple Brain listening on port ${PORT}`));
+app.listen(PORT, () => console.log(`GCM HRTC Triple Brain v5 on port ${PORT}`));
