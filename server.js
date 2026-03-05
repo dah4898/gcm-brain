@@ -203,31 +203,32 @@ const signalHistory = [];
 //  NORMALISE WEBHOOK — handle both old and new indicator formats
 // ══════════════════════════════════════════════════════════════════════════
 function normalisePayload(body) {
-  // New format from GCM HRTC Strategy
   if (body.action) {
     const isBull = body.action === 'buy';
-    const isBear = body.action === 'sell';
     return {
       ticker:       body.ticker,
       timeframe:    body.timeframe || '—',
       price:        parseFloat(body.price),
-      high:         parseFloat(body.high)   || null,
-      low:          parseFloat(body.low)    || null,
-      barVolume:    parseFloat(body.volume) || null,
+      high:         parseFloat(body.high)    || null,
+      low:          parseFloat(body.low)     || null,
+      barVolume:    parseFloat(body.volume)  || null,
       action:       body.action,
-      context:      body.context   || '',
-      liquidity:    body.liquidity || '',
-      // Map to internal signal format
-      harsi_candle: isBull ? 'bullish' : 'bearish',
-      harsi_prev:   isBull ? 'bearish' : 'bullish',
-      rsi_now:      isBull ? 4  : -4,
-      rsi_prev:     isBull ? -2 : 2,
-      divergence:   'none',
+      context:      body.context             || '',
+      liquidity:    body.liquidity           || '',
+      // Use REAL RSI values from indicator if provided, else fall back to estimates
+      rsi_now:      body.rsi_now  !== undefined ? parseFloat(body.rsi_now)  : (isBull ? 4  : -4),
+      rsi_prev:     body.rsi_prev !== undefined ? parseFloat(body.rsi_prev) : (isBull ? -2 : 2),
+      // New rich fields from optimised indicator
+      htf1_rsi:     body.htf1_rsi !== undefined ? parseFloat(body.htf1_rsi) : null,
+      harsi_candle: body.harsi_candle || (isBull ? 'bullish' : 'bearish'),
+      harsi_prev:   body.harsi_prev   || (isBull ? 'bearish' : 'bullish'),
+      divergence:   body.divergence   || 'none',
+      htf_bias:     body.htf_bias     || null,
+      obos:         body.obos         || 'neutral',
       isClose:      body.action === 'close',
       format:       'v5'
     };
   }
-  // Legacy format — pass through unchanged
   return { ...body, format: 'legacy' };
 }
 
@@ -555,10 +556,17 @@ Bar Range:      ${barRange}
 Bar Volume:     ${barVolCtx}
 Timeframe:      ${timeframe}
 RSI (0-centered): ${rsi_now} (std: ~${rsiStd})  |  Prev: ${rsi_prev}
+HTF1 RSI:       ${payload.htf1_rsi !== null ? payload.htf1_rsi : 'N/A'} ${payload.htf_bias ? '→ HTF bias: ' + payload.htf_bias.toUpperCase() : ''}
+HARSI Candle:   ${harsi_candle} (prev: ${harsi_prev})
 Divergence:     ${divergence || 'none'}
+OB/OS Zone:     ${payload.obos || 'neutral'}
 Signal Context: ${context}
 Liquidity Tag:  ${liquidity || 'N/A'}
 ${isStrategy ? '✅ Strategy-grade signal: HTF confirmation + momentum filter + OB/OS filter all passed before this fired' : ''}
+${payload.htf_bias === 'bearish' && isBull ? '⚠ WARNING: BUY signal but HTF cloud is BEARISH — counter-trend entry' : ''}
+${payload.htf_bias === 'bullish' && !isBull && !isClose ? '⚠ WARNING: SELL signal but HTF cloud is BULLISH — counter-trend entry' : ''}
+${payload.obos === 'overbought' && isBull ? '⚠ NOTE: BUY signal firing in OVERBOUGHT zone — momentum entry, not value' : ''}
+${payload.obos === 'oversold' && !isBull && !isClose ? '⚠ NOTE: SELL signal firing in OVERSOLD zone — momentum entry, not value' : ''}
 
 ╔═══════════════════════════════════════╗
   QUALITY SCORE: ${quality.total}/100 — ${quality.tier} (${quality.grade})
@@ -574,8 +582,10 @@ ${isClose
   ? `This is an EXIT signal. Evaluate whether closing the position now is the right call based on RSI momentum and current market structure.`
   : `Evaluate this ${actionLabel} signal from the GCM HRTC strategy:
 - The strategy already passed HTF cloud confirmation, RSI momentum filter (min delta), and optional OB/OS zone filter
-- Is RSI momentum at ${rsi_now} zero-centered strong enough to trust this entry?
-- What does the quality score of ${quality.total}/100 say about conviction?`}
+- RSI is ${rsi_now} zero-centered (prev: ${rsi_prev}) — is this momentum strong enough?
+- HTF cloud bias is ${payload.htf_bias || 'unknown'} — does the signal align or fight the higher timeframe?
+- OB/OS zone: ${payload.obos || 'neutral'} — does this improve or reduce conviction?
+- What does the quality score of ${quality.total}/100 say about overall conviction?`}
 
 HRTC VERDICT: [1–2 sentences]
 
