@@ -244,13 +244,21 @@ async function fetchPolygonData(ticker) {
 
   const results = {};
 
+  // 5 second timeout on all Polygon requests
+  const fetchWithTimeout = (url, ms=5000) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    return fetch(url, { signal: controller.signal })
+      .finally(() => clearTimeout(timer));
+  };
+
   try {
     // Snapshot
     const snapUrl = isCrypto
       ? `https://api.polygon.io/v2/snapshot/locale/global/markets/crypto/tickers/${polyTicker}?apiKey=${POLYGON_API_KEY}`
       : `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${polyTicker}?apiKey=${POLYGON_API_KEY}`;
 
-    const snapRes  = await fetch(snapUrl);
+    const snapRes  = await fetchWithTimeout(snapUrl);
     const snapData = await snapRes.json();
     const snap     = snapData?.ticker || snapData?.results?.[0] || null;
 
@@ -316,7 +324,7 @@ async function fetchPolygonData(ticker) {
 
     // Block trade scan (stocks only)
     if (!isCrypto) {
-      const tRes  = await fetch(`https://api.polygon.io/v3/trades/${polyTicker}?limit=50&apiKey=${POLYGON_API_KEY}`);
+      const tRes  = await fetchWithTimeout(`https://api.polygon.io/v3/trades/${polyTicker}?limit=50&apiKey=${POLYGON_API_KEY}`);
       const tData = await tRes.json();
       const trades = tData?.results || [];
       if (trades.length > 0) {
