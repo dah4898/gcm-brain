@@ -454,7 +454,7 @@ function scoreSignal({ rsi_now, rsi_prev, divergence, timeframe, signals, format
 async function runTripleBrainAnalysis(payload, signals, quality, marketData) {
   const { ticker, timeframe, price, high, low, barVolume,
           rsi_now, rsi_prev, divergence, context, liquidity,
-          action, format } = payload;
+          action, format, harsi_candle, harsi_prev } = payload;
 
   const isBull     = signals.overallBull;
   const isClose    = action === 'close';
