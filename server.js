@@ -23,7 +23,6 @@ app.use(express.json());
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET    || 'gcm-secret-change-me';
-const POLYGON_API_KEY   = process.env.POLYGON_API_KEY   || '';
 const PORT              = process.env.PORT              || 3000;
 
 
@@ -235,40 +234,50 @@ function normalisePayload(body) {
 // ══════════════════════════════════════════════════════════════════════════
 //  ENGINE 3 — POLYGON.IO LIVE MARKET DATA
 // ══════════════════════════════════════════════════════════════════════════
-async function fetchPolygonData(ticker) {
-  const isCrypto = ['BTC','ETH','SOL','XRP','BNB','DOGE','ADA'].some(c => ticker.includes(c))
-                || ticker.includes('/');
-
-  let polyTicker = ticker.replace('/', '').replace('-','').toUpperCase();
-  if (isCrypto) polyTicker = 'X:' + polyTicker.replace('USDT','USD');
-
+// ══════════════════════════════════════════════════════════════════════════
+//  ENGINE 3 — YAHOO FINANCE MARKET DATA + OPTIONS CHAIN
+//  Replaces Polygon — no API key required, completely free
+//  Fetches: quote, volume, bid/ask, price change + full options chain
+// ══════════════════════════════════════════════════════════════════════════
+async function fetchMarketData(ticker) {
   const results = {};
 
-  // 5 second timeout on all Polygon requests
-  const fetchWithTimeout = (url, ms=5000) => {
+  const fetchWithTimeout = (url, ms = 6000) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ms);
-    return fetch(url, { signal: controller.signal })
-      .finally(() => clearTimeout(timer));
+    return fetch(url, {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    }).finally(() => clearTimeout(timer));
   };
 
+  // Clean ticker for Yahoo — BTC/USD → BTC-USD
+  const isCrypto = ['BTC','ETH','SOL','XRP','BNB','DOGE'].some(c => ticker.toUpperCase().includes(c));
+  const yahooTicker = isCrypto
+    ? ticker.replace('/', '-').replace('USDT','USD').toUpperCase()
+    : ticker.toUpperCase();
+
   try {
-    // Snapshot
-    const snapUrl = isCrypto
-      ? `https://api.polygon.io/v2/snapshot/locale/global/markets/crypto/tickers/${polyTicker}?apiKey=${POLYGON_API_KEY}`
-      : `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${polyTicker}?apiKey=${POLYGON_API_KEY}`;
+    // ── 1. Quote — price, volume, bid/ask, day range ─────────────────────
+    const quoteUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooTicker}?interval=1d&range=2d`;
+    const quoteRes  = await fetchWithTimeout(quoteUrl);
+    const quoteData = await quoteRes.json();
+    const meta      = quoteData?.chart?.result?.[0]?.meta || null;
 
-    const snapRes  = await fetchWithTimeout(snapUrl);
-    const snapData = await snapRes.json();
-    const snap     = snapData?.ticker || snapData?.results?.[0] || null;
+    if (meta) {
+      const price       = meta.regularMarketPrice      || null;
+      const prevClose   = meta.chartPreviousClose      || meta.previousClose || null;
+      const dayHigh     = meta.regularMarketDayHigh    || null;
+      const dayLow      = meta.regularMarketDayLow     || null;
+      const open        = meta.regularMarketOpen       || null;
+      const volume      = meta.regularMarketVolume     || null;
+      const avgVolume   = meta.averageDailyVolume10Day || meta.averageDailyVolume3Month || null;
+      const bid         = meta.bid  || null;
+      const ask         = meta.ask  || null;
+      const marketState = meta.marketState || 'CLOSED';
 
-    if (snap) {
-      const day  = snap.day     || {};
-      const prev = snap.prevDay || {};
-
-      const todayVol = day.v  || 0;
-      const prevVol  = prev.v || 0;
-      const volRatio = prevVol > 0 ? todayVol / prevVol : null;
+      // Volume analysis
+      const volRatio   = (volume && avgVolume) ? volume / avgVolume : null;
       const volContext = volRatio === null ? 'N/A'
         : volRatio < 0.3  ? 'VERY LOW — strong liquidity vacuum risk'
         : volRatio < 0.6  ? 'LOW — thin market, move may not sustain'
@@ -277,74 +286,238 @@ async function fetchPolygonData(ticker) {
         : volRatio < 2.0  ? 'ABOVE AVERAGE — conviction present'
         : 'HIGH — institutional activity likely';
 
-      const bid    = snap.lastQuote?.P || snap.lastQuote?.bp || 0;
-      const ask    = snap.lastQuote?.p || snap.lastQuote?.ap || 0;
-      const spread = (bid && ask) ? ((ask - bid) / bid * 100).toFixed(4) : null;
+      // Bid/ask spread
+      const spread = (bid && ask && bid > 0)
+        ? ((ask - bid) / bid * 100).toFixed(4) : null;
       const spreadContext = !spread ? 'N/A'
         : parseFloat(spread) > 0.1  ? 'WIDE — order book thinning, low depth'
         : parseFloat(spread) > 0.05 ? 'MODERATE — normal conditions'
         : 'TIGHT — deep order book, healthy liquidity';
 
-      const vwap      = day.vw || null;
-      const lastPrice = snap.lastTrade?.p || day.c || null;
-      const vwapContext = (!vwap || !lastPrice) ? 'N/A'
-        : lastPrice > vwap * 1.005 ? `ABOVE VWAP $${vwap?.toFixed(2)} — bullish institutional bias`
-        : lastPrice < vwap * 0.995 ? `BELOW VWAP $${vwap?.toFixed(2)} — bearish institutional bias`
-        : `AT VWAP $${vwap?.toFixed(2)} — key decision zone`;
+      // Price change
+      const priceChange = (price && prevClose)
+        ? ((price - prevClose) / prevClose * 100).toFixed(2) : null;
 
-      const priceChange = (lastPrice && prev.c)
-        ? ((lastPrice - prev.c) / prev.c * 100).toFixed(2) : null;
-
+      // Liquidity vacuum: big move on low volume
       const liqVacuum = (volRatio !== null && volRatio < 0.5
         && priceChange && Math.abs(parseFloat(priceChange)) > 0.5)
-        ? `⚠ LIQUIDITY VACUUM — price moved ${priceChange}% on ${(volRatio*100).toFixed(0)}% of normal volume`
+        ? `⚠ LIQUIDITY VACUUM — price moved ${priceChange}% on ${(volRatio*100).toFixed(0)}% of avg volume`
         : null;
 
-      results.snapshot = {
-        lastPrice, vwap: vwap?.toFixed(2),
-        todayVol: todayVol.toLocaleString(),
-        prevVol:  prevVol.toLocaleString(),
-        volRatio: volRatio ? (volRatio*100).toFixed(0)+'% of yesterday' : 'N/A',
-        volContext, spreadContext, vwapContext,
-        spread: spread ? spread+'%' : 'N/A',
-        bid: bid || 'N/A', ask: ask || 'N/A',
-        priceChange: priceChange ? priceChange+'%' : 'N/A',
-        open:  day.o?.toFixed(2) || 'N/A',
-        high:  day.h?.toFixed(2) || 'N/A',
-        low:   day.l?.toFixed(2) || 'N/A',
+      results.quote = {
+        price, prevClose, dayHigh, dayLow, open,
+        volume:       volume ? parseInt(volume).toLocaleString() : 'N/A',
+        avgVolume:    avgVolume ? parseInt(avgVolume).toLocaleString() : 'N/A',
+        volRatio:     volRatio ? (volRatio*100).toFixed(0)+'% of avg' : 'N/A',
+        volContext,
+        bid:          bid ? bid.toFixed(2) : 'N/A',
+        ask:          ask ? ask.toFixed(2) : 'N/A',
+        spread:       spread ? spread+'%' : 'N/A',
+        spreadContext,
+        priceChange:  priceChange ? priceChange+'%' : 'N/A',
+        marketState,
         liqVacuum,
+        gapContext: priceChange
+          ? parseFloat(priceChange) > 2   ? `GAP UP ${priceChange}% — institutions may fade`
+          : parseFloat(priceChange) < -2  ? `GAP DOWN ${priceChange}% — watch for institutional support`
+          : `No significant gap (${priceChange}%)`
+          : null,
       };
-
-      results.gapContext = priceChange
-        ? parseFloat(priceChange) > 2  ? `GAP UP ${priceChange}% — institutions may fade`
-        : parseFloat(priceChange) < -2 ? `GAP DOWN ${priceChange}% — watch for support`
-        : `No significant gap (${priceChange}%)`
-        : null;
     }
 
-    // Block trade scan (stocks only)
+    // ── 2. Options Chain — gamma walls, max pain, put/call ratio ─────────
+    // Only for stocks/ETFs — skip crypto
     if (!isCrypto) {
-      const tRes  = await fetchWithTimeout(`https://api.polygon.io/v3/trades/${polyTicker}?limit=50&apiKey=${POLYGON_API_KEY}`);
-      const tData = await tRes.json();
-      const trades = tData?.results || [];
-      if (trades.length > 0) {
-        const sizes  = trades.map(t => t.size || 0);
-        const avg    = sizes.reduce((a,b) => a+b, 0) / sizes.length;
-        const blocks = trades.filter(t => (t.size||0) > avg * 5);
-        results.trades = {
-          avgTradeSize:    Math.round(avg).toLocaleString(),
-          largestTrade:    Math.max(...sizes).toLocaleString(),
-          blockTradeCount: blocks.length,
-          blockContext: blocks.length > 3
-            ? `⚠ ${blocks.length} BLOCK TRADES detected — institutional activity`
-            : blocks.length > 0
-            ? `${blocks.length} large trade(s) — monitor for accumulation/distribution`
-            : 'No significant block trades — retail flow dominant',
+      const optUrl = `https://query1.finance.yahoo.com/v7/finance/options/${yahooTicker}`;
+      const optRes  = await fetchWithTimeout(optUrl);
+      const optData = await optRes.json();
+      const optResult = optData?.optionChain?.result?.[0] || null;
+
+      if (optResult) {
+        const currentPrice = optResult.quote?.regularMarketPrice || parseFloat(results.quote?.price) || 0;
+        const calls = optResult.options?.[0]?.calls || [];
+        const puts  = optResult.options?.[0]?.puts  || [];
+        const expiryDates = optResult.expirationDates || [];
+
+        // Find nearest expiry
+        const now = Date.now() / 1000;
+        const nearestExpiry = expiryDates.find(d => d > now) || expiryDates[0];
+        const expiryDate = nearestExpiry
+          ? new Date(nearestExpiry * 1000).toLocaleDateString('en-US', { month:'short', day:'numeric' })
+          : 'N/A';
+
+        // ATM strikes — within 2% of current price
+        const atmRange = currentPrice * 0.02;
+        const atmCalls = calls.filter(c => Math.abs((c.strike||0) - currentPrice) <= atmRange);
+        const atmPuts  = puts.filter(p  => Math.abs((p.strike||0) - currentPrice) <= atmRange);
+
+        // Max OI strikes — gamma walls
+        const sortedCalls = [...calls].sort((a,b) => (b.openInterest||0) - (a.openInterest||0));
+        const sortedPuts  = [...puts].sort((a,b)  => (b.openInterest||0) - (a.openInterest||0));
+
+        const topCallWall = sortedCalls[0] || null;
+        const topPutWall  = sortedPuts[0]  || null;
+        const topCallWall2 = sortedCalls[1] || null;
+        const topPutWall2  = sortedPuts[1]  || null;
+
+        // Call wall above price (resistance) and put wall below (support)
+        const callWallAbove = sortedCalls.filter(c => (c.strike||0) > currentPrice)[0] || topCallWall;
+        const putWallBelow  = sortedPuts.filter(p  => (p.strike||0) < currentPrice)[0] || topPutWall;
+
+        // Total OI for put/call ratio
+        const totalCallOI = calls.reduce((s,c) => s + (c.openInterest||0), 0);
+        const totalPutOI  = puts.reduce((s,p)  => s + (p.openInterest||0), 0);
+        const pcRatio     = totalCallOI > 0 ? (totalPutOI / totalCallOI).toFixed(2) : 'N/A';
+        const pcContext   = pcRatio === 'N/A' ? 'N/A'
+          : parseFloat(pcRatio) > 1.5 ? 'BEARISH — heavy put buying, fear elevated'
+          : parseFloat(pcRatio) > 1.0 ? 'SLIGHTLY BEARISH — more puts than calls'
+          : parseFloat(pcRatio) > 0.7 ? 'NEUTRAL — balanced options flow'
+          : parseFloat(pcRatio) > 0.5 ? 'SLIGHTLY BULLISH — call buying dominant'
+          : 'BULLISH — heavy call buying, greed elevated';
+
+        // Max pain — strike where most options expire worthless
+        let maxPainStrike = null;
+        let maxPainValue  = Infinity;
+        const allStrikes = [...new Set([...calls, ...puts].map(o => o.strike).filter(Boolean))].sort((a,b) => a-b);
+        for (const strike of allStrikes) {
+          const callLoss = calls.reduce((s,c) => s + Math.max(0, strike - (c.strike||0)) * (c.openInterest||0), 0);
+          const putLoss  = puts.reduce((s,p)  => s + Math.max(0, (p.strike||0) - strike) * (p.openInterest||0), 0);
+          const total    = callLoss + putLoss;
+          if (total < maxPainValue) { maxPainValue = total; maxPainStrike = strike; }
+        }
+
+        // IV from ATM options
+        const atmIV = atmCalls[0]?.impliedVolatility || atmPuts[0]?.impliedVolatility || null;
+        const ivContext = !atmIV ? 'N/A'
+          : atmIV > 0.4  ? 'VERY HIGH IV — expensive options, large move expected'
+          : atmIV > 0.25 ? 'HIGH IV — elevated uncertainty'
+          : atmIV > 0.15 ? 'MODERATE IV — normal conditions'
+          : 'LOW IV — calm market, small move expected';
+
+        // Gamma flip zone — between highest put wall and call wall
+        const gammaFlipZone = (callWallAbove && putWallBelow)
+          ? `$${putWallBelow.strike}–$${callWallAbove.strike}`
+          : 'N/A';
+
+        // ── GEX (Gamma Exposure) Calculation ─────────────────────────────
+        // GEX = OI × Gamma × 100 × spotPrice
+        // Positive GEX = market makers long gamma = they BUY dips, SELL rips = price pinned
+        // Negative GEX = market makers short gamma = they SELL dips, BUY rips = price accelerates
+        //
+        // We approximate gamma from IV and distance from spot using Black-Scholes gamma proxy:
+        // Gamma ≈ PDF(d1) / (S × σ × √T)
+        // For simplicity: gamma proxy = exp(-0.5 × ((strike-spot)/atmIV/spot)^2) / (spot × atmIV)
+
+        const T = Math.max(1, (nearestExpiry - now) / (365 * 24 * 3600)); // time to expiry in years
+        const ivForGex = atmIV || 0.20; // fallback 20% IV
+
+        let totalGex      = 0;
+        let gexByStrike   = {};
+        let posGexStrikes = [];
+        let negGexStrikes = [];
+
+        for (const call of calls) {
+          const K  = call.strike || 0;
+          const oi = call.openInterest || 0;
+          if (!K || !oi) continue;
+          const d1    = (Math.log(currentPrice / K) + (0.5 * ivForGex * ivForGex * T)) / (ivForGex * Math.sqrt(T));
+          const gamma = Math.exp(-0.5 * d1 * d1) / (Math.sqrt(2 * Math.PI) * currentPrice * ivForGex * Math.sqrt(T));
+          const gex   = oi * gamma * 100 * currentPrice; // calls = positive GEX (dealers long)
+          totalGex += gex;
+          gexByStrike[K] = (gexByStrike[K] || 0) + gex;
+        }
+
+        for (const put of puts) {
+          const K  = put.strike || 0;
+          const oi = put.openInterest || 0;
+          if (!K || !oi) continue;
+          const d1    = (Math.log(currentPrice / K) + (0.5 * ivForGex * ivForGex * T)) / (ivForGex * Math.sqrt(T));
+          const gamma = Math.exp(-0.5 * d1 * d1) / (Math.sqrt(2 * Math.PI) * currentPrice * ivForGex * Math.sqrt(T));
+          const gex   = -(oi * gamma * 100 * currentPrice); // puts = negative GEX (dealers short)
+          totalGex += gex;
+          gexByStrike[K] = (gexByStrike[K] || 0) + gex;
+        }
+
+        // GEX zero cross — strike where GEX flips from positive to negative
+        // This is the true gamma flip level — most important level in options
+        const sortedGexStrikes = Object.entries(gexByStrike)
+          .map(([k,g]) => ({ strike: parseFloat(k), gex: g }))
+          .sort((a,b) => a.strike - b.strike);
+
+        // Find strikes near current price with highest absolute GEX
+        const nearStrikes = sortedGexStrikes.filter(s =>
+          Math.abs(s.strike - currentPrice) <= currentPrice * 0.05 // within 5%
+        );
+
+        // GEX pin level = strike with highest positive GEX near spot (dealers most hedged here)
+        const pinCandidates = nearStrikes.filter(s => s.gex > 0).sort((a,b) => b.gex - a.gex);
+        const gexPinLevel   = pinCandidates[0] || null;
+
+        // GEX zero cross — where total cumulative GEX flips sign
+        let cumGex = 0;
+        let gexZeroCross = null;
+        for (const s of sortedGexStrikes) {
+          const prevCum = cumGex;
+          cumGex += s.gex;
+          if (prevCum > 0 && cumGex <= 0 || prevCum < 0 && cumGex >= 0) {
+            gexZeroCross = s.strike;
+            break;
+          }
+        }
+
+        // GEX regime
+        const gexRegime = totalGex > 0
+          ? 'POSITIVE GEX — dealers are long gamma. They BUY when price falls and SELL when price rises. Expect mean reversion, range-bound price action, and resistance at call walls.'
+          : 'NEGATIVE GEX — dealers are short gamma. They SELL when price falls and BUY when price rises. Expect trend continuation, volatility expansion, and acceleration through key levels.';
+
+        // Top GEX strikes — largest absolute exposure
+        const topGexStrikes = [...sortedGexStrikes]
+          .sort((a,b) => Math.abs(b.gex) - Math.abs(a.gex))
+          .slice(0, 5)
+          .map(s => `$${s.strike} (${s.gex > 0 ? '+' : ''}${(s.gex/1e6).toFixed(1)}M)`)
+          .join(', ');
+
+        // Price vs pin level
+        const distToPin = gexPinLevel ? (currentPrice - gexPinLevel.strike).toFixed(2) : null;
+        const pinContext = !gexPinLevel ? 'No clear pin level identified' :
+          Math.abs(parseFloat(distToPin)) < 0.50 ? `⚠ PRICE AT GEX PIN $${gexPinLevel.strike} — strong magnetic pull, expect range-bound chop` :
+          parseFloat(distToPin) > 0 ? `Price $${distToPin} ABOVE pin at $${gexPinLevel.strike} — gravity pulling back down` :
+          `Price $${Math.abs(distToPin)} BELOW pin at $${gexPinLevel.strike} — gravity pulling up toward pin`;
+
+        results.options = {
+          expiry:         expiryDate,
+          currentPrice:   currentPrice.toFixed(2),
+          // Gamma walls (OI-based)
+          callWallAbove:  callWallAbove  ? `$${callWallAbove.strike} (OI: ${(callWallAbove.openInterest||0).toLocaleString()})` : 'N/A',
+          putWallBelow:   putWallBelow   ? `$${putWallBelow.strike} (OI: ${(putWallBelow.openInterest||0).toLocaleString()})`  : 'N/A',
+          topCallWall:    topCallWall    ? `$${topCallWall.strike} (OI: ${(topCallWall.openInterest||0).toLocaleString()})`    : 'N/A',
+          topPutWall:     topPutWall     ? `$${topPutWall.strike} (OI: ${(topPutWall.openInterest||0).toLocaleString()})`     : 'N/A',
+          topCallWall2:   topCallWall2   ? `$${topCallWall2.strike} (OI: ${(topCallWall2.openInterest||0).toLocaleString()})` : 'N/A',
+          topPutWall2:    topPutWall2    ? `$${topPutWall2.strike} (OI: ${(topPutWall2.openInterest||0).toLocaleString()})`   : 'N/A',
+          gammaFlipZone,
+          maxPain:        maxPainStrike ? `$${maxPainStrike}` : 'N/A',
+          totalCallOI:    totalCallOI.toLocaleString(),
+          totalPutOI:     totalPutOI.toLocaleString(),
+          pcRatio,
+          pcContext,
+          atmIV:          atmIV ? (atmIV * 100).toFixed(1)+'%' : 'N/A',
+          ivContext,
+          // GEX fields
+          gexRegime,
+          gexPinLevel:    gexPinLevel ? `$${gexPinLevel.strike} (GEX: +${(gexPinLevel.gex/1e6).toFixed(1)}M)` : 'N/A',
+          gexZeroCross:   gexZeroCross ? `$${gexZeroCross}` : 'N/A',
+          pinContext,
+          topGexStrikes,
+          totalGex:       `${totalGex > 0 ? '+' : ''}${(totalGex/1e6).toFixed(0)}M`,
+          gexPositive:    totalGex > 0,
         };
+
+        console.log(`[Yahoo Options] ${yahooTicker} | GEX: ${(totalGex/1e6).toFixed(0)}M (${totalGex>0?'POSITIVE':'NEGATIVE'}) | Pin: $${gexPinLevel?.strike||'N/A'} | Zero Cross: $${gexZeroCross||'N/A'} | Max Pain: $${maxPainStrike} | P/C: ${pcRatio}`);
       }
     }
+
   } catch (err) {
-    console.warn(`[Polygon] ${ticker}:`, err.message);
+    console.warn(`[Yahoo Finance] ${ticker}:`, err.message);
     results.error = err.message;
   }
 
@@ -461,8 +634,8 @@ async function runTripleBrainAnalysis(payload, signals, quality, marketData) {
   const actionLabel = isClose ? 'EXIT/CLOSE' : isBull ? 'BUY' : 'SELL';
   const rsiStd     = (parseFloat(rsi_now) + 50).toFixed(1);
   const isStrategy = format === 'v5';
-  const snap       = marketData?.snapshot;
-  const trades     = marketData?.trades;
+  const snap       = marketData?.quote;
+  const trades     = null; // replaced by Yahoo options
 
   // Bar range context
   const barRange = (high && low) ? `$${low} – $${high} (range: $${(high-low).toFixed(2)})` : 'N/A';
@@ -470,31 +643,54 @@ async function runTripleBrainAnalysis(payload, signals, quality, marketData) {
     ? `${parseInt(barVolume).toLocaleString()} (this bar)`
     : 'N/A';
 
-  const marketSection = snap ? `
+  const q    = marketData?.quote    || null;
+  const opts = marketData?.options  || null;
+
+  const marketSection = q ? `
 ╔═══════════════════════════════════════╗
-  LIVE MARKET DATA (Polygon.io)
+  LIVE MARKET DATA (Yahoo Finance)
 ╚═══════════════════════════════════════╝
-Last Price:     $${snap.lastPrice || price}
-Today's Range:  $${snap.low} – $${snap.high}  |  Open: $${snap.open}
+Last Price:     $${q.price?.toFixed(2) || price}  [${q.marketState || 'CLOSED'}]
+Today's Range:  $${q.dayLow?.toFixed(2)||'N/A'} – $${q.dayHigh?.toFixed(2)||'N/A'}  |  Open: $${q.open?.toFixed(2)||'N/A'}
 Bar Range:      ${barRange}
 Bar Volume:     ${barVolCtx}
-Price Change:   ${snap.priceChange} vs yesterday  ${marketData.gapContext ? '→ ' + marketData.gapContext : ''}
+Price Change:   ${q.priceChange} vs yesterday  ${q.gapContext ? '→ ' + q.gapContext : ''}
 
 VOLUME:
-Daily Volume:   ${snap.todayVol} (${snap.volRatio})
-Assessment:     ${snap.volContext}
-${snap.liqVacuum ? snap.liqVacuum : '✓ No liquidity vacuum detected'}
+Today's Volume: ${q.volume} vs avg ${q.avgVolume} (${q.volRatio})
+Assessment:     ${q.volContext}
+${q.liqVacuum ? q.liqVacuum : '✓ No liquidity vacuum detected'}
 
 ORDER BOOK:
-Bid/Ask Spread: ${snap.spread} — ${snap.spreadContext}
+Bid: $${q.bid}  |  Ask: $${q.ask}  |  Spread: ${q.spread} — ${q.spreadContext}
+` : `Market data unavailable${marketData?.error ? ': ' + marketData.error : ''}`
 
-VWAP:           ${snap.vwapContext}
+  const optionsSection = opts ? `
+╔═══════════════════════════════════════╗
+  OPTIONS + GEX (Yahoo Finance) — Exp: ${opts.expiry}
+╚═══════════════════════════════════════╝
+Current Price:  $${opts.currentPrice}
+Max Pain:       ${opts.maxPain} — gravitational pin at expiry
 
-${trades ? `BLOCK TRADES (last 50):
-Avg Trade Size: ${trades.avgTradeSize}
-Largest Trade:  ${trades.largestTrade}
-${trades.blockContext}` : ''}
-` : `Market data unavailable${marketData?.error ? ': ' + marketData.error : ''}`;
+GAMMA WALLS (Open Interest):
+Call Wall Above: ${opts.callWallAbove} ← dealer resistance ceiling
+Put Wall Below:  ${opts.putWallBelow} ← dealer support floor
+Top Calls: ${opts.topCallWall} | ${opts.topCallWall2}
+Top Puts:  ${opts.topPutWall}  | ${opts.topPutWall2}
+
+GEX ANALYSIS (Gamma Exposure):
+GEX Regime:      ${opts.gexRegime}
+Total Net GEX:   ${opts.totalGexStr}
+Gamma Flip:      ${opts.gammaFlipPoint} — ${opts.gammaFlipContext}
+Pin Strikes:     ${opts.topPinStrikes} ← price attracted here
+Repel Strikes:   ${opts.topRepelStrikes} ← price accelerates away
+${opts.pinContext}
+
+SENTIMENT:
+Put/Call Ratio:  ${opts.pcRatio} — ${opts.pcContext}
+ATM Implied Vol: ${opts.atmIV} — ${opts.ivContext}
+Total Call OI: ${opts.totalCallOI}  |  Total Put OI: ${opts.totalPutOI}
+` : '';
 
   // Detect asset type for QQQ-specific reasoning
   const isQQQ    = (ticker||'').toUpperCase() === 'QQQ' || (ticker||'').toUpperCase().includes('QQQ');
@@ -582,6 +778,7 @@ ${payload.obos === 'oversold' && !isBull && !isClose ? '⚠ NOTE: SELL signal fi
 Confluence ${quality.breakdown.confluence.score}/35 | RSI ${quality.breakdown.rsiStrength.score}/25 | Divergence ${quality.breakdown.divergence.score}/20 | Timeframe ${quality.breakdown.timeframe.score}/20
 ${quality.divOpposes ? '⚠ DIVERGENCE OPPOSES SIGNAL' : ''}
 ${marketSection}
+${optionsSection}
 ${srSection}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FRAMEWORK A — HRTC SIGNAL EVALUATION
@@ -625,23 +822,40 @@ Using Polygon live data:
    ${snap?.vwapContext ? '→ ' + snap.vwapContext : '→ N/A'}
 
 4. DARK POOL PROXY: Block trade evidence?
-   ${trades?.blockContext ? '→ ' + trades.blockContext : isQQQ ? '→ No block trades detected in last 50 trades' : '→ Block trade scan not available for crypto'}
+   ${opts ? '→ See Framework D for institutional options flow' : '→ Options data not available'}
 
 MICROSTRUCTURE VERDICT: [CONFIRMS / CONFLICTS / NEUTRAL]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FRAMEWORK D — OPTIONS FLOW & GAMMA ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+\${opts ? \`Using Yahoo Finance options chain (expiry: \${opts.expiry}):
+
+1. GEX REGIME: \${opts.gexRegime} Total exposure: \${opts.totalGex}. Is the current GEX environment favorable for this \${actionLabel} signal?
+
+2. GEX PIN ANALYSIS: \${opts.pinContext}. The GEX zero cross (true gamma flip) is at \${opts.gexZeroCross}. Is price above or below this level and what does that mean for dealer hedging flow?
+
+3. GAMMA WALLS (OI-based): Call wall \${opts.callWallAbove} = resistance. Put wall \${opts.putWallBelow} = support. Top GEX strikes: \${opts.topGexStrikes}. Is price approaching a high-GEX strike that will cause pinning or rejection?
+
+4. MAX PAIN: \${opts.maxPain}. With expiry \${opts.expiry}, is price likely to gravitate toward max pain or has it already moved away significantly?
+
+5. PUT/CALL + IV: P/C \${opts.pcRatio} (\${opts.pcContext}). ATM IV \${opts.atmIV} (\${opts.ivContext}). Does sentiment and volatility pricing support or oppose this signal?\` : 'Options data unavailable — skip this framework.'}
+
+OPTIONS VERDICT: [CONFIRMS / CONFLICTS / NEUTRAL — one sentence]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FINAL CROSS-REFERENCED VERDICT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DECISION: [ACTIONABLE / WAIT / AVOID]
-REASON: [One sentence — do all three frameworks agree?]
+REASON: [One sentence — do all four frameworks agree?]
 ENTRY CONDITION: [Exact trigger or "enter now at market"]
 INVALIDATION: [What cancels this setup]
 POSITION SIZING: [FULL / REDUCED / SKIP]
 
 Rules:
-- ACTIONABLE → Score ≥65 AND liquidity aligns AND microstructure confirms AND no liq vacuum
-- WAIT       → Score 40–64 OR near absorption zone OR microstructure neutral
-- AVOID      → Score <40 OR liq vacuum detected OR frameworks conflict`;
+- ACTIONABLE → Score ≥65 AND liquidity aligns AND microstructure confirms AND options flow confirms AND no liq vacuum
+- WAIT       → Score 40–64 OR near gamma wall OR microstructure neutral OR options conflict
+- AVOID      → Score <40 OR liq vacuum detected OR price at max pain pin zone OR frameworks conflict`;
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -652,7 +866,7 @@ Rules:
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 1600,
+      max_tokens: 2000,
       messages: [{ role: 'user', content: prompt }]
     })
   });
@@ -708,9 +922,9 @@ app.post('/webhook', async (req, res) => {
     const payload    = normalisePayload(body);
     const signals    = computeSignals(payload);
     const quality    = scoreSignal({ ...payload, signals });
-    const marketData = await fetchPolygonData(payload.ticker);
+    const marketData = await fetchMarketData(payload.ticker);
 
-    console.log(`[Polygon] Vol: ${marketData?.snapshot?.volRatio||'N/A'} | Spread: ${marketData?.snapshot?.spread||'N/A'} | VWAP: ${marketData?.snapshot?.vwap||'N/A'}`);
+    console.log(`[Yahoo] Vol: ${marketData?.quote?.volRatio||'N/A'} | Spread: ${marketData?.quote?.spread||'N/A'} | VWAP: ${marketData?.quote?.price||'N/A'}`);
 
     const ai = await runTripleBrainAnalysis(payload, signals, quality, marketData);
 
