@@ -188,6 +188,78 @@ function getQQQContext(price) {
   };
 }
 
+
+// ══════════════════════════════════════════════════════════════════════════
+//  TIME CONTEXT — CST market session awareness for 0DTE/1DTE analysis
+// ══════════════════════════════════════════════════════════════════════════
+function getTimeContext() {
+  const now    = new Date();
+  // CST = UTC-6, CDT = UTC-5. Railway runs UTC so we calculate CST offset
+  const utcH   = now.getUTCHours();
+  const utcM   = now.getUTCMinutes();
+  // Approximate CST (UTC-6) — adjust to UTC-5 during daylight saving manually if needed
+  const cstH   = (utcH - 6 + 24) % 24;
+  const cstMin = utcM;
+  const totalMin = cstH * 60 + cstMin;
+
+  // Market open = 8:30 CST, close = 15:00 CST
+  const OPEN  = 8  * 60 + 30;  // 8:30am CST
+  const CLOSE = 15 * 60 + 0;   // 3:00pm CST (4pm EST)
+
+  const minutesLeft   = Math.max(0, CLOSE - totalMin);
+  const minutesIn     = Math.max(0, totalMin - OPEN);
+  const isMarketHours = totalMin >= OPEN && totalMin < CLOSE;
+
+  // Session phases
+  const phase =
+    totalMin < OPEN              ? 'PRE-MARKET'       :
+    totalMin < OPEN + 30         ? 'OPENING (0-30min)' :
+    totalMin < OPEN + 90         ? 'EARLY SESSION'    :
+    totalMin < 11 * 60           ? 'MID-MORNING'      :
+    totalMin < 13 * 60           ? 'DEAD ZONE (avoid)':
+    totalMin < 13 * 60 + 30      ? 'EARLY AFTERNOON'  :
+    totalMin < 14 * 60           ? 'MAX PAIN GRAVITY BUILDING' :
+    totalMin < 14 * 60 + 30      ? 'POWER HOUR APPROACHING'   :
+    totalMin < CLOSE - 30        ? 'POWER HOUR'        :
+    totalMin < CLOSE - 10        ? 'FINAL 30 MIN — HIGH RISK' :
+    totalMin < CLOSE             ? 'LAST 10 MIN — AVOID 0DTE' :
+                                   'AFTER HOURS';
+
+  // Theta urgency for 0DTE
+  const thetaUrgency =
+    !isMarketHours               ? 'N/A'     :
+    minutesLeft > 300            ? 'LOW'     :  // >5hrs left
+    minutesLeft > 180            ? 'MEDIUM'  :  // >3hrs
+    minutesLeft > 90             ? 'HIGH'    :  // >1.5hrs
+    minutesLeft > 30             ? 'EXTREME' :  // <1.5hrs
+                                   'CRITICAL';  // <30min
+
+  // Score penalty for time-weighted scoring (Phase 5 item 30)
+  // After 2:30pm CST (14:30), require higher base score
+  const requiresHighScore = totalMin >= 14 * 60 + 30;
+  const minScoreFor0DTE   = requiresHighScore ? 80 : 65;
+
+  // Max pain gravity multiplier — doubles after 1pm EST (12pm CST)
+  const maxPainGravity = totalMin >= 12 * 60 ? '2x (strong)' : '1x (normal)';
+
+  // Vanna/Charm risk assessment based on time
+  // Charm accelerates after 2pm EST (1pm CST)
+  const charmActive = totalMin >= 13 * 60;
+  const charmRisk   = !isMarketHours ? 'N/A' :
+    totalMin >= 14 * 60 + 30 ? 'EXTREME — dealer delta decay in final stretch' :
+    totalMin >= 13 * 60      ? 'HIGH — charm pulling price toward pin/max pain' :
+    totalMin >= 11 * 60 + 30 ? 'MODERATE' : 'LOW';
+
+  const timeStr = `${String(cstH).padStart(2,'0')}:${String(cstMin).padStart(2,'0')} CST`;
+
+  return {
+    timeStr, phase, thetaUrgency, minutesLeft, minutesIn,
+    isMarketHours, requiresHighScore, minScoreFor0DTE,
+    maxPainGravity, charmActive, charmRisk,
+    hoursLeft: (minutesLeft / 60).toFixed(1),
+  };
+}
+
 // ── SSE broadcast ──────────────────────────────────────────────────────────
 const clients = new Set();
 function broadcast(data) {
@@ -621,242 +693,244 @@ function scoreSignal({ rsi_now, rsi_prev, divergence, timeframe, signals, format
   return { total, grade, tier, breakdown, divOpposes };
 }
 
+
+// ══════════════════════════════════════════════════════════════════════════
+//  COMPOSITE SCORE — extends base 0-100 with dealer/market/timing context
+//  Scores >100 = Grade S (all forces aligned)
+//  Phase 1 item 7 — feeds Grade S detection in dashboard
+// ══════════════════════════════════════════════════════════════════════════
+function computeCompositeScore(baseScore, marketData, timeCtx, signals) {
+  const opts  = marketData?.options || null;
+  const quote = marketData?.quote   || null;
+  const isBull = signals.overallBull;
+  let bonus = 0;
+  const factors = [];
+
+  // ── Dealer Flow (max +15) ──────────────────────────────────────────────
+  if (opts) {
+    // GEX regime aligned with signal direction
+    const gexAligned = opts.gexPositive === false; // negative GEX = trending = good for directional
+    if (gexAligned) { bonus += 5; factors.push('GEX negative regime (+5 trending)'); }
+
+    // Price above/below gamma flip (zero cross) supports direction
+    const zeroCross = parseFloat((opts.gexZeroCross||'0').replace('$',''));
+    const price     = parseFloat(opts.currentPrice);
+    const flipAligned = isBull ? price > zeroCross : price < zeroCross;
+    if (zeroCross && flipAligned) { bonus += 5; factors.push('Price beyond gamma flip (+5)'); }
+
+    // P/C ratio supports direction
+    const pc = parseFloat(opts.pcRatio);
+    const pcAligned = isBull ? pc < 0.8 : pc > 1.2;
+    if (!isNaN(pc) && pcAligned) { bonus += 5; factors.push('P/C ratio aligned (+5)'); }
+  }
+
+  // ── Market Context (max +10) ───────────────────────────────────────────
+  if (quote) {
+    // Volume above average
+    const volR = parseFloat((quote.volRatio||'0').replace('%','').replace(' of avg',''));
+    if (volR >= 120) { bonus += 5; factors.push('Volume 120%+ of avg (+5)'); }
+    else if (volR >= 100) { bonus += 2; factors.push('Volume at avg (+2)'); }
+
+    // No liquidity vacuum
+    if (!quote.liqVacuum) { bonus += 3; factors.push('No liquidity vacuum (+3)'); }
+    // Tight spread
+    const sp = parseFloat((quote.spread||'999').replace('%',''));
+    if (sp <= 0.05) { bonus += 2; factors.push('Tight spread (+2)'); }
+  }
+
+  // ── Session Timing (max +10) ───────────────────────────────────────────
+  if (timeCtx.isMarketHours) {
+    // Best windows: opening 30min or power hour
+    if (timeCtx.phase.includes('OPENING') || timeCtx.phase.includes('POWER HOUR')) {
+      bonus += 7; factors.push('Prime session window (+7)');
+    } else if (timeCtx.phase.includes('EARLY SESSION') || timeCtx.phase.includes('MID-MORNING')) {
+      bonus += 4; factors.push('Good session window (+4)');
+    } else if (timeCtx.phase.includes('DEAD ZONE') || timeCtx.phase.includes('FINAL') || timeCtx.phase.includes('LAST')) {
+      bonus -= 5; factors.push('Poor session window (-5)');
+    }
+    // Theta urgency penalty for 0DTE
+    if (timeCtx.thetaUrgency === 'EXTREME') { bonus -= 3; factors.push('Extreme theta decay (-3)'); }
+    if (timeCtx.thetaUrgency === 'CRITICAL') { bonus -= 8; factors.push('Critical theta decay (-8)'); }
+  }
+
+  const composite = baseScore + bonus;
+  const isGradeS  = composite > 100;
+  const grade =
+    isGradeS          ? 'S' :
+    composite >= 80   ? 'A' :
+    composite >= 65   ? 'B' :
+    composite >= 50   ? 'C' :
+    composite >= 35   ? 'D' : 'F';
+
+  return { composite, bonus, grade, isGradeS, factors };
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 //  ENGINE 2 — TRIPLE-BRAIN AI PROMPT
 // ══════════════════════════════════════════════════════════════════════════
-async function runTripleBrainAnalysis(payload, signals, quality, marketData) {
+async function runTripleBrainAnalysis(payload, signals, quality, marketData, timeCtx, composite) {
   const { ticker, timeframe, price, high, low, barVolume,
           rsi_now, rsi_prev, divergence, context, liquidity,
           action, format, harsi_candle, harsi_prev } = payload;
 
-  const isBull     = signals.overallBull;
-  const isClose    = action === 'close';
-  const actionLabel = isClose ? 'EXIT/CLOSE' : isBull ? 'BUY' : 'SELL';
-  const rsiStd     = (parseFloat(rsi_now) + 50).toFixed(1);
-  const isStrategy = format === 'v5';
-  const snap       = marketData?.quote;
-  const trades     = null; // replaced by Yahoo options
+  const isBull      = signals.overallBull;
+  const isClose     = action === 'close';
+  const actionLabel = isClose ? 'EXIT/CLOSE' : isBull ? 'BUY CALL' : 'BUY PUT';
+  const rsiStd      = (parseFloat(rsi_now) + 50).toFixed(1);
+  const isStrategy  = format === 'v5';
+  const q           = marketData?.quote   || null;
+  const opts        = marketData?.options || null;
 
-  // Bar range context
-  const barRange = (high && low) ? `$${low} – $${high} (range: $${(high-low).toFixed(2)})` : 'N/A';
-  const barVolCtx = barVolume
-    ? `${parseInt(barVolume).toLocaleString()} (this bar)`
-    : 'N/A';
+  const barRange  = (high && low) ? `$${low} – $${high} (range: $${(high-low).toFixed(2)})` : 'N/A';
+  const barVolCtx = barVolume ? `${parseInt(barVolume).toLocaleString()} (this bar)` : 'N/A';
 
-  const q    = marketData?.quote    || null;
-  const opts = marketData?.options  || null;
-
-  const marketSection = q ? `
-╔═══════════════════════════════════════╗
-  LIVE MARKET DATA (Yahoo Finance)
-╚═══════════════════════════════════════╝
-Last Price:     $${q.price?.toFixed(2) || price}  [${q.marketState || 'CLOSED'}]
-Today's Range:  $${q.dayLow?.toFixed(2)||'N/A'} – $${q.dayHigh?.toFixed(2)||'N/A'}  |  Open: $${q.open?.toFixed(2)||'N/A'}
-Bar Range:      ${barRange}
-Bar Volume:     ${barVolCtx}
-Price Change:   ${q.priceChange} vs yesterday  ${q.gapContext ? '→ ' + q.gapContext : ''}
-
-VOLUME:
-Today's Volume: ${q.volume} vs avg ${q.avgVolume} (${q.volRatio})
-Assessment:     ${q.volContext}
-${q.liqVacuum ? q.liqVacuum : '✓ No liquidity vacuum detected'}
-
-ORDER BOOK:
-Bid: $${q.bid}  |  Ask: $${q.ask}  |  Spread: ${q.spread} — ${q.spreadContext}
-` : `Market data unavailable${marketData?.error ? ': ' + marketData.error : ''}`
-
-  const optionsSection = opts ? `
-╔═══════════════════════════════════════╗
-  OPTIONS + GEX (Yahoo Finance) — Exp: ${opts.expiry}
-╚═══════════════════════════════════════╝
-Current Price:  $${opts.currentPrice}
-Max Pain:       ${opts.maxPain} — gravitational pin at expiry
-
-GAMMA WALLS (Open Interest):
-Call Wall Above: ${opts.callWallAbove} ← dealer resistance ceiling
-Put Wall Below:  ${opts.putWallBelow} ← dealer support floor
-Top Calls: ${opts.topCallWall} | ${opts.topCallWall2}
-Top Puts:  ${opts.topPutWall}  | ${opts.topPutWall2}
-
-GEX ANALYSIS (Gamma Exposure):
-GEX Regime:      ${opts.gexRegime}
-Total Net GEX:   ${opts.totalGexStr}
-Gamma Flip:      ${opts.gammaFlipPoint} — ${opts.gammaFlipContext}
-Pin Strikes:     ${opts.topPinStrikes} ← price attracted here
-Repel Strikes:   ${opts.topRepelStrikes} ← price accelerates away
-${opts.pinContext}
-
-SENTIMENT:
-Put/Call Ratio:  ${opts.pcRatio} — ${opts.pcContext}
-ATM Implied Vol: ${opts.atmIV} — ${opts.ivContext}
-Total Call OI: ${opts.totalCallOI}  |  Total Put OI: ${opts.totalPutOI}
-` : '';
-
-  // Detect asset type for QQQ-specific reasoning
-  const isQQQ    = (ticker||'').toUpperCase() === 'QQQ' || (ticker||'').toUpperCase().includes('QQQ');
+  // Detect asset
+  const isQQQ    = (ticker||'').toUpperCase().includes('QQQ');
   const isCrypto = ['BTC','ETH','SOL','XRP'].some(c => (ticker||'').toUpperCase().includes(c));
-  const assetType = isQQQ ? 'QQQ (Nasdaq-100 ETF)' : isCrypto ? 'Crypto' : 'Equity/ETF';
 
-  const assetContext = isQQQ ? `
-ASSET CONTEXT — QQQ (Nasdaq-100 ETF):
-- Market hours 9:30am–4:00pm EST only. Best signals in opening hour and power hour (3–4pm).
-- Avoid the 12:00–2:00pm dead zone — thin liquidity, unreliable reversals.
-- Key psychological levels are whole dollars ($480, $485, $490, $500) and half dollars ($482.50 etc).
-- VWAP is the primary institutional execution benchmark for QQQ. Above VWAP = bull bias, below = bear bias.
-- Dark pool block prints on QQQ are highly significant — large ETF blocks often precede moves by 15–30 min.
-- QQQ options create gamma walls at round dollar strikes. These act as magnets AND hard resistance/support.
-- SPY/QQQ correlation is tight — a signal conflicting with SPY macro direction is lower conviction.
-- Opening range breakout (first 30 min high/low) is a key institutional reference level for the session.
-` : isCrypto ? `
-ASSET CONTEXT — Crypto (24/7 market):
-- No market hours — low-liquidity overnight sessions produce unreliable signals.
-- Key psychological levels are large round numbers ($100K, $95K, $90K for BTC).
-- Block trade data not available via Polygon for crypto.
-` : `
-ASSET CONTEXT — Equity/ETF:
-- Market hours 9:30am–4:00pm EST.
-- Respect whole dollar and 50-cent psychological levels.
-- VWAP is the primary institutional benchmark.
-`;
-
-  // Compute QQQ S/R context if applicable
+  // S/R context
   const srCtx = isQQQ ? getQQQContext(price) : null;
 
-  // S/R section for prompt
+  // ── Vanna/Charm assessment ─────────────────────────────────────────────
+  const atmIV = parseFloat((opts?.atmIV||'0').replace('%',''));
+  // Vanna risk: IV elevated (>20%) = dealer unhedging risk if IV drops
+  const vannaRisk = atmIV > 30 ? 'HIGH — IV elevated, if IV drops dealers will unhedge, creating headwinds' :
+                    atmIV > 20 ? 'MODERATE — IV above normal, monitor for IV crush' :
+                    atmIV > 0  ? 'LOW — IV normal, vanna impact minimal' : 'N/A';
+  const vannaGreen = atmIV > 0 && atmIV <= 20 && (isBull ? true : true); // low IV = vanna neutral/helpful
+  const charmGreen = timeCtx.charmActive && opts && (
+    // Charm is green for bulls when put OI > call OI (dealers buy back short stock hedges)
+    isBull ? parseFloat(opts.pcRatio||'0') > 1.0 : parseFloat(opts.pcRatio||'0') < 0.8
+  );
+  const vannacharmStatus = `Vanna: ${vannaRisk} | Charm: ${timeCtx.charmRisk}${charmGreen ? ' ✅ working WITH position' : timeCtx.charmActive ? ' ⚠ monitor direction' : ''}`;
+
+  // ── Expected move vs actual ────────────────────────────────────────────
+  let expectedMoveSection = '';
+  if (opts && q) {
+    // ATM straddle = nearest call IV × underlying × sqrt(T/365) × 0.4 (simplified)
+    // Better: use ATM call + ATM put last price if available
+    const atmCallPrice = parseFloat(opts.atmCallPrice||'0');
+    const atmPutPrice  = parseFloat(opts.atmPutPrice||'0');
+    const expectedMove = (atmCallPrice + atmPutPrice) > 0
+      ? (atmCallPrice + atmPutPrice).toFixed(2)
+      : atmIV > 0 ? (q.price * (atmIV/100) * Math.sqrt(1/252) * 1.25).toFixed(2) : null;
+
+    const actualMove = q.price && q.prevClose
+      ? Math.abs(q.price - q.prevClose).toFixed(2) : null;
+    const movePct = expectedMove && actualMove
+      ? ((parseFloat(actualMove) / parseFloat(expectedMove)) * 100).toFixed(0) : null;
+
+    if (expectedMove) {
+      const moveWarning = movePct && parseInt(movePct) > 80
+        ? `⚠ GAS TANK ${movePct}% USED — only $${(parseFloat(expectedMove)-parseFloat(actualMove)).toFixed(2)} of expected move remaining`
+        : movePct ? `Gas tank ${movePct}% used — $${(parseFloat(expectedMove)-parseFloat(actualMove||0)).toFixed(2)} remaining` : '';
+      expectedMoveSection = `Expected Daily Move: ±$${expectedMove} | Actual Move: $${actualMove||'N/A'} | ${moveWarning}`;
+    }
+  }
+
+  // ── Build prompt sections ──────────────────────────────────────────────
+  const marketSection = q ? `
+MARKET DATA
+Price: $${q.price?.toFixed(2)||price} [${q.marketState||'CLOSED'}] | Range: $${q.dayLow?.toFixed(2)||'N/A'}–$${q.dayHigh?.toFixed(2)||'N/A'} | Open: $${q.open?.toFixed(2)||'N/A'}
+Volume: ${q.volume} vs avg ${q.avgVolume} (${q.volRatio}) — ${q.volContext}
+Bid/Ask: $${q.bid}/$${q.ask} | Spread: ${q.spread} — ${q.spreadContext}
+${q.liqVacuum || '✓ No liquidity vacuum'}
+${q.gapContext||''}
+${expectedMoveSection}` : 'Market data unavailable';
+
+  const optionsSection = opts ? `
+OPTIONS & GEX [Exp: ${opts.expiry}]
+Max Pain: ${opts.maxPain} | Gravity: ${timeCtx.maxPainGravity}
+GEX Regime: ${opts.gexRegime}
+GEX Pin: ${opts.gexPinLevel} | Zero Cross: ${opts.gexZeroCross} | ${opts.pinContext}
+Call Wall: ${opts.callWallAbove} | Put Wall: ${opts.putWallBelow}
+Top GEX Strikes: ${opts.topGexStrikes}
+P/C: ${opts.pcRatio} (${opts.pcContext}) | ATM IV: ${opts.atmIV} (${opts.ivContext})
+${vannacharmStatus}` : '';
+
   const srSection = srCtx ? `
-╔═══════════════════════════════════════╗
-  QQQ KEY S/R LEVELS (Live Map)
-╚═══════════════════════════════════════╝
-Signal Price:      $${price}
-${srCtx.zoneStr ? srCtx.zoneStr : '✓ Price not inside a cluster zone'}
+S/R LEVELS
+${srCtx.zoneStr || '✓ Price not in cluster zone'}
+Resistance: ${srCtx.nearRStr} | Support: ${srCtx.nearSStr}
+R/S Ratio: ${srCtx.rsRatio} → ${srCtx.rrContext}
+Major R: ${srCtx.majorRStr} | Major S: ${srCtx.majorSStr}
+${srCtx.clustered ? '⚠ DENSE CLUSTER — multiple levels within $2' : ''}` : '';
 
-NEAREST LEVELS:
-Resistance Above:  ${srCtx.nearRStr}
-Support Below:     ${srCtx.nearSStr}
-Next Resistance:   ${srCtx.nextR ? '$' + srCtx.nextR.price + ' (' + (srCtx.nextR.label||'') + ')' : 'N/A'}
-Next Support:      ${srCtx.nextS ? '$' + srCtx.nextS.price + ' (' + (srCtx.nextS.label||'') + ')' : 'N/A'}
+  // ── SYSTEM PROMPT ──────────────────────────────────────────────────────
+  const systemPrompt = `You are the GCM HRTC Tactical Options Brain — a risk manager at an institutional trading desk specializing in QQQ 0DTE and 1DTE options. You are obsessed with theta decay and gamma exposure. You do not give financial advice; you provide high-conviction mathematical analysis of market microstructure and dealer positioning.
 
-MAJOR LEVELS:
-Major Resistance:  ${srCtx.majorRStr}
-Major Support:     ${srCtx.majorSStr}
+CORE RULES:
+- If Score < 65: be extremely skeptical. Most signals at this level are noise.
+- If Score > 85 or Grade S: be aggressive but warn of melt-up/melt-down traps.
+- Always lead with GEX and dealer positioning before technicals.
+- For 0DTE: theta is the enemy. Every minute costs premium. Only ACTIONABLE when conviction is high.
+- For 1DTE: more runway but overnight gap risk. Flag if signal fires near close.
+- DECISION must be exactly one of: ACTIONABLE / WAIT / AVOID
 
-RISK/REWARD:
-Dist to Resistance: $${srCtx.distToR}
-Dist to Support:    $${srCtx.distToS}
-R/S Ratio:          ${srCtx.rsRatio} → ${srCtx.rrContext}
-${srCtx.clustered ? '⚠ PRICE IN DENSE CLUSTER — multiple levels within $2, choppy price action likely' : ''}
-` : '';
+OUTPUT FORMAT — follow this exactly, no deviations:
 
-  const prompt = `You are a triple-engine trading analyst specializing in ${assetType}. A signal just fired from the GCM Heikin Ashi RSI Trend Cloud strategy. Run all three frameworks then deliver a final verdict.
-${assetContext}
+SIGNAL: [BUY CALL / BUY PUT / EXIT] [suggested strike] @ $[price] | Score: [composite]/100 | [time CST] | [timeframe]
 
-╔═══════════════════════════════════════╗
-  SIGNAL INPUT
-╚═══════════════════════════════════════╝
-Ticker:         ${ticker}
-Action:         ${actionLabel}
-Price:          $${price}
-Bar Range:      ${barRange}
-Bar Volume:     ${barVolCtx}
-Timeframe:      ${timeframe}
-RSI (0-centered): ${rsi_now} (std: ~${rsiStd})  |  Prev: ${rsi_prev}
-HTF1 RSI:       ${payload.htf1_rsi !== null ? payload.htf1_rsi : 'N/A'} ${payload.htf_bias ? '→ HTF bias: ' + payload.htf_bias.toUpperCase() : ''}
-HARSI Candle:   ${harsi_candle} (prev: ${harsi_prev})
-Divergence:     ${divergence || 'none'}
-OB/OS Zone:     ${payload.obos || 'neutral'}
-Signal Context: ${context}
-Liquidity Tag:  ${liquidity || 'N/A'}
-${isStrategy ? '✅ Strategy-grade signal: HTF confirmation + momentum filter + OB/OS filter all passed before this fired' : ''}
-${payload.htf_bias === 'bearish' && isBull ? '⚠ WARNING: BUY signal but HTF cloud is BEARISH — counter-trend entry' : ''}
-${payload.htf_bias === 'bullish' && !isBull && !isClose ? '⚠ WARNING: SELL signal but HTF cloud is BULLISH — counter-trend entry' : ''}
-${payload.obos === 'overbought' && isBull ? '⚠ NOTE: BUY signal firing in OVERBOUGHT zone — momentum entry, not value' : ''}
-${payload.obos === 'oversold' && !isBull && !isClose ? '⚠ NOTE: SELL signal firing in OVERSOLD zone — momentum entry, not value' : ''}
+DIRECTION
+[2-3 sentences: RSI momentum, HTF cloud alignment, OB/OS context. State conviction level clearly.]
 
-╔═══════════════════════════════════════╗
-  QUALITY SCORE: ${quality.total}/100 — ${quality.tier} (${quality.grade})
-╚═══════════════════════════════════════╝
-Confluence ${quality.breakdown.confluence.score}/35 | RSI ${quality.breakdown.rsiStrength.score}/25 | Divergence ${quality.breakdown.divergence.score}/20 | Timeframe ${quality.breakdown.timeframe.score}/20
-${quality.divOpposes ? '⚠ DIVERGENCE OPPOSES SIGNAL' : ''}
+GEX & PIN
+- GEX: [total] | [POSITIVE pin mode / NEGATIVE trending mode]
+- Critical: Pin $[level] | Flip $[level] | Call Wall $[level] | Put Wall $[level]
+- Dealer Logic: [One sentence on how dealers will hedge this move.]
+- Vanna/Charm: [status — working for or against position]
+
+STRIKE GUIDANCE
+- Target: $[strike] (~[delta] delta) — [why this strike]
+- Avoid: $[strikes] — [reason: pin zone / theta trap / call wall]
+- Theta Warning: [LOW / MEDIUM / HIGH / EXTREME / CRITICAL]
+
+MAX PAIN & GRAVITY
+- Max Pain: $[level] | Gravity: [strength]
+- [One sentence: is price moving toward or away from max pain?]
+
+IV & PREMIUM
+- ATM IV: [%] | [CHEAP / FAIR / EXPENSIVE]
+- P/C Flow: [interpretation]
+
+LEVELS
+- R: $[level] ([label]) | S: $[level] ([label]) | R/S: [ratio]
+- [One note on volume or liquidity]
+
+DECISION: [ACTIONABLE / WAIT / AVOID]
+- ENTRY: [specific trigger + volume requirement]
+- INVALIDATION: $[underlying level] — est. [X]% loss on premium
+- 0DTE TACTIC: [time-based rule, e.g. "Exit by 2:00pm CST if target not reached"]
+- 1DTE TACTIC: [overnight consideration, e.g. "Hold through open if above $X, exit pre-market otherwise"]`;
+
+  // ── USER PROMPT ────────────────────────────────────────────────────────
+  const userPrompt = `Analyze this QQQ options signal:
+
+SESSION CONTEXT
+Time: ${timeCtx.timeStr} | Phase: ${timeCtx.phase} | ${timeCtx.minutesLeft}min to close
+Theta Urgency (0DTE): ${timeCtx.thetaUrgency} | Min Score Required: ${timeCtx.minScoreFor0DTE}/100
+Max Pain Gravity: ${timeCtx.maxPainGravity} | Charm Risk: ${timeCtx.charmRisk}
+
+SIGNAL
+Ticker: ${ticker} | Action: ${actionLabel} | Price: $${price}
+Timeframe: ${timeframe} | RSI: ${rsi_now} (prev: ${rsi_prev}) | HTF Bias: ${payload.htf_bias||'unknown'}
+HARSI: ${harsi_candle} (was ${harsi_prev}) | Divergence: ${divergence||'none'} | OB/OS: ${payload.obos||'neutral'}
+Signal: ${context} | Liquidity Tag: ${liquidity||'N/A'}
+${payload.htf_bias === 'bearish' && isBull ? '⚠ COUNTER-TREND: BUY signal vs bearish HTF cloud' : ''}
+${payload.htf_bias === 'bullish' && !isBull && !isClose ? '⚠ COUNTER-TREND: SELL signal vs bullish HTF cloud' : ''}
+
+SCORE
+Base HRTC: ${quality.total}/100 (${quality.tier} ${quality.grade}) | Composite: ${composite.composite}/100 (Grade ${composite.grade})${composite.isGradeS ? ' 🌟 GRADE S — ALL FORCES ALIGNED' : ''}
+Confluence: ${quality.breakdown.confluence.score}/35 | RSI: ${quality.breakdown.rsiStrength.score}/25 | Divergence: ${quality.breakdown.divergence.score}/20 | Timeframe: ${quality.breakdown.timeframe.score}/20
+${composite.factors.length ? 'Composite factors: ' + composite.factors.join(', ') : ''}
+${quality.divOpposes ? '⚠ DIVERGENCE OPPOSES SIGNAL — significant warning' : ''}
+${composite.isGradeS ? '🌟 GRADE S: All dealer mechanics, market context, and technicals aligned simultaneously. Highest conviction setup.' : ''}
+
 ${marketSection}
 ${optionsSection}
-${srSection}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FRAMEWORK A — HRTC SIGNAL EVALUATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-${isClose
-  ? `This is an EXIT signal. Evaluate whether closing the position now is the right call based on RSI momentum and current market structure.`
-  : `Evaluate this ${actionLabel} signal from the GCM HRTC strategy:
-- The strategy already passed HTF cloud confirmation, RSI momentum filter (min delta), and optional OB/OS zone filter
-- RSI is ${rsi_now} zero-centered (prev: ${rsi_prev}) — is this momentum strong enough?
-- HTF cloud bias is ${payload.htf_bias || 'unknown'} — does the signal align or fight the higher timeframe?
-- OB/OS zone: ${payload.obos || 'neutral'} — does this improve or reduce conviction?
-- What does the quality score of ${quality.total}/100 say about overall conviction?`}
+${srSection}`;
 
-HRTC VERDICT: [1–2 sentences]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FRAMEWORK B — LIQUIDITY SANDWICH
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The indicator already tagged this signal as: "${liquidity || context}"
-Use that as context alongside your own analysis.
-
-THE TAPE:
-1. ABSORPTION ZONE: The nearest resistance is ${srCtx ? srCtx.nearRStr : 'unknown'} and nearest support is ${srCtx ? srCtx.nearSStr : 'unknown'}. Is the signal price approaching, sitting at, or extended from these institutional clusters? ${srCtx?.zoneStr ? 'NOTE: ' + srCtx.zoneStr : ''}
-2. VALUE BUYERS/SELLERS: With the R/S ratio of ${srCtx ? srCtx.rsRatio : 'N/A'} (${srCtx ? srCtx.rrContext : 'N/A'}), is $${price} at value or is this a chase entry into resistance?
-3. THE RISK: Given the level map above, what specific stop-hunt or liquidity trap is most likely before the real move? Name the specific price level institutions would target.
-
-LIQUIDITY VERDICT: [BUY / SELL / HOLD — one sentence]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FRAMEWORK C — MARKET MICROSTRUCTURE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Using Polygon live data:
-
-1. VOLUME CONVICTION: Is this move backed by real volume or a liquidity vacuum?
-   ${snap?.liqVacuum || '→ Assess volume context above'}
-
-2. ORDER BOOK HEALTH: Bid/ask spread signals?
-   ${snap?.spreadContext ? '→ ' + snap.spreadContext : '→ N/A'}
-
-3. VWAP BIAS: Institutional positioning?
-   ${snap?.vwapContext ? '→ ' + snap.vwapContext : '→ N/A'}
-
-4. DARK POOL PROXY: Block trade evidence?
-   ${opts ? '→ See Framework D for institutional options flow' : '→ Options data not available'}
-
-MICROSTRUCTURE VERDICT: [CONFIRMS / CONFLICTS / NEUTRAL]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FRAMEWORK D — OPTIONS FLOW & GAMMA ANALYSIS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-\${opts ? \`Using Yahoo Finance options chain (expiry: \${opts.expiry}):
-
-1. GEX REGIME: \${opts.gexRegime} Total exposure: \${opts.totalGex}. Is the current GEX environment favorable for this \${actionLabel} signal?
-
-2. GEX PIN ANALYSIS: \${opts.pinContext}. The GEX zero cross (true gamma flip) is at \${opts.gexZeroCross}. Is price above or below this level and what does that mean for dealer hedging flow?
-
-3. GAMMA WALLS (OI-based): Call wall \${opts.callWallAbove} = resistance. Put wall \${opts.putWallBelow} = support. Top GEX strikes: \${opts.topGexStrikes}. Is price approaching a high-GEX strike that will cause pinning or rejection?
-
-4. MAX PAIN: \${opts.maxPain}. With expiry \${opts.expiry}, is price likely to gravitate toward max pain or has it already moved away significantly?
-
-5. PUT/CALL + IV: P/C \${opts.pcRatio} (\${opts.pcContext}). ATM IV \${opts.atmIV} (\${opts.ivContext}). Does sentiment and volatility pricing support or oppose this signal?\` : 'Options data unavailable — skip this framework.'}
-
-OPTIONS VERDICT: [CONFIRMS / CONFLICTS / NEUTRAL — one sentence]
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FINAL CROSS-REFERENCED VERDICT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DECISION: [ACTIONABLE / WAIT / AVOID]
-REASON: [One sentence — do all four frameworks agree?]
-ENTRY CONDITION: [Exact trigger or "enter now at market"]
-INVALIDATION: [What cancels this setup]
-POSITION SIZING: [FULL / REDUCED / SKIP]
-
-Rules:
-- ACTIONABLE → Score ≥65 AND liquidity aligns AND microstructure confirms AND options flow confirms AND no liq vacuum
-- WAIT       → Score 40–64 OR near gamma wall OR microstructure neutral OR options conflict
-- AVOID      → Score <40 OR liq vacuum detected OR price at max pain pin zone OR frameworks conflict`;
-
+  // ── API CALL WITH STREAMING ────────────────────────────────────────────
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -865,9 +939,11 @@ Rules:
       'anthropic-version': '2023-06-01'
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      messages: [{ role: 'user', content: prompt }]
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 1200,
+      system:     systemPrompt,
+      stream:     false, // we use SSE for dashboard streaming separately
+      messages:   [{ role: 'user', content: userPrompt }]
     })
   });
 
@@ -876,12 +952,23 @@ Rules:
   const text = data.content?.map(b => b.text || '').join('') || '';
 
   const verdictMatch = text.match(/DECISION:\s*(ACTIONABLE|WAIT|AVOID)/i);
-  const sizeMatch    = text.match(/POSITION SIZING:\s*(FULL|REDUCED|SKIP)/i);
+  const sizeMatch    = text.match(/POSITION SIZING:\s*(FULL|REDUCED|SKIP)/i) ||
+                       text.match(/SIZE:\s*(FULL|REDUCED|SKIP)/i);
   const verdict      = verdictMatch ? verdictMatch[1].toUpperCase() : 'WAIT';
   const sizing       = sizeMatch    ? sizeMatch[1].toUpperCase()    : 'REDUCED';
 
-  return { text, verdict, sizing };
+  // Extract Vanna/Charm status for dashboard indicator
+  const vannaCharmForDash = {
+    vannaRisk,
+    vannaGreen: atmIV > 0 && atmIV <= 20,
+    charmGreen,
+    charmRisk: timeCtx.charmRisk,
+    charmActive: timeCtx.charmActive,
+  };
+
+  return { text, verdict, sizing, vannaCharmForDash, composite, timeCtx };
 }
+
 
 // ══════════════════════════════════════════════════════════════════════════
 //  ROUTES
@@ -926,7 +1013,11 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`[Yahoo] Vol: ${marketData?.quote?.volRatio||'N/A'} | Spread: ${marketData?.quote?.spread||'N/A'} | VWAP: ${marketData?.quote?.price||'N/A'}`);
 
-    const ai = await runTripleBrainAnalysis(payload, signals, quality, marketData);
+    const timeCtx   = getTimeContext();
+    const composite = computeCompositeScore(quality.total, marketData, timeCtx, signals);
+    const ai        = await runTripleBrainAnalysis(payload, signals, quality, marketData, timeCtx, composite);
+
+    console.log(`[Score] Base: ${quality.total} | Composite: ${composite.composite} | Grade: ${composite.grade}${composite.isGradeS ? ' 🌟 GRADE S' : ''} | Vanna: ${ai.vannaCharmForDash?.vannaRisk?.split(' ')[0]||'N/A'} | Charm: ${timeCtx.charmRisk}`);
 
     const record = {
       type: 'signal', id: Date.now(),
@@ -943,6 +1034,10 @@ app.post('/webhook', async (req, res) => {
       rsi_prev:  parseFloat(payload.rsi_prev),
       divergence: payload.divergence,
       signals, quality, marketData,
+      composite: ai.composite,
+      timeCtx:   ai.timeCtx,
+      vannaCharm: ai.vannaCharmForDash,
+      isGradeS:  composite.isGradeS,
       analysis: ai.text,
       verdict:  ai.verdict,
       sizing:   ai.sizing,
