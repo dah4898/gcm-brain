@@ -194,12 +194,29 @@ function getQQQContext(price) {
 // ══════════════════════════════════════════════════════════════════════════
 function getTimeContext() {
   const now    = new Date();
-  // CST = UTC-6, CDT = UTC-5. Railway runs UTC so we calculate CST offset
   const utcH   = now.getUTCHours();
   const utcM   = now.getUTCMinutes();
-  // Approximate CST (UTC-6) — adjust to UTC-5 during daylight saving manually if needed
-  const cstH   = (utcH - 6 + 24) % 24;
-  const cstMin = utcM;
+
+  // ── DST-aware offset ──────────────────────────────────────────────────
+  // US CDT (UTC-5): 2nd Sun Mar → 1st Sun Nov
+  // US CST (UTC-6): 1st Sun Nov → 2nd Sun Mar
+  // We calculate the exact DST boundaries for the current year so Railway
+  // (which runs UTC) always uses the correct market-local hour.
+  function nthSundayOfMonth(year, month, n) {
+    // month: 0=Jan … 11=Dec
+    const d = new Date(Date.UTC(year, month, 1));
+    const day = d.getUTCDay(); // 0=Sun
+    const first = day === 0 ? 1 : 8 - day;
+    return new Date(Date.UTC(year, month, first + (n - 1) * 7));
+  }
+  const yr         = now.getUTCFullYear();
+  const dstStart   = nthSundayOfMonth(yr, 2,  2); // 2nd Sun March (2:00am local = spring forward)
+  const dstEnd     = nthSundayOfMonth(yr, 10, 1); // 1st Sun November (2:00am local = fall back)
+  const isDST      = now >= dstStart && now < dstEnd;
+  const utcOffset  = isDST ? -5 : -6;             // CDT = UTC-5, CST = UTC-6
+  const localH     = ((utcH + utcOffset) + 24) % 24;
+  const cstH       = localH;
+  const cstMin     = utcM;
   const totalMin = cstH * 60 + cstMin;
 
   // Market open = 8:30 CST, close = 15:00 CST
@@ -250,7 +267,8 @@ function getTimeContext() {
     totalMin >= 13 * 60      ? 'HIGH — charm pulling price toward pin/max pain' :
     totalMin >= 11 * 60 + 30 ? 'MODERATE' : 'LOW';
 
-  const timeStr = `${String(cstH).padStart(2,'0')}:${String(cstMin).padStart(2,'0')} CST`;
+  const tzLabel = isDST ? 'CDT' : 'CST';
+  const timeStr = `${String(cstH).padStart(2,'0')}:${String(cstMin).padStart(2,'0')} ${tzLabel}`;
 
   return {
     timeStr, phase, thetaUrgency, minutesLeft, minutesIn,
@@ -296,6 +314,12 @@ function normalisePayload(body) {
       divergence:   body.divergence   || 'none',
       htf_bias:     body.htf_bias     || null,
       obos:         body.obos         || 'neutral',
+      // CVD fields from updated GCM+CVD indicator
+      cvd:          body.cvd           !== undefined ? parseFloat(body.cvd)           : null,
+      delta:        body.delta         !== undefined ? parseFloat(body.delta)         : null,
+      cvd_bias:     body.cvd_bias      || null,
+      cvd_strength: body.cvd_strength  !== undefined ? parseInt(body.cvd_strength)   : null,
+      cvd_confirmed: body.cvd_confirmed !== undefined ? body.cvd_confirmed === true || body.cvd_confirmed === 'true' : false,
       isClose:      body.action === 'close',
       format:       'v5'
     };
@@ -572,6 +596,9 @@ async function fetchMarketData(ticker) {
           totalPutOI:     totalPutOI.toLocaleString(),
           pcRatio,
           pcContext,
+          // ATM straddle prices for expected move calculation
+          atmCallPrice:   atmCalls[0]?.lastPrice?.toFixed(2) || '0',
+          atmPutPrice:    atmPuts[0]?.lastPrice?.toFixed(2)  || '0',
           atmIV:          atmIV ? (atmIV * 100).toFixed(1)+'%' : 'N/A',
           ivContext,
           // GEX fields
@@ -621,7 +648,8 @@ function computeSignals({ rsi_now, rsi_prev, harsi_candle, harsi_prev, divergenc
 //  Strategy signals get a base quality boost since they've already passed
 //  HTF filter, momentum filter, and OB/OS filter before firing
 // ══════════════════════════════════════════════════════════════════════════
-function scoreSignal({ rsi_now, rsi_prev, divergence, timeframe, signals, format }) {
+function scoreSignal({ rsi_now, rsi_prev, divergence, timeframe, signals, format,
+                        cvd_bias, cvd_strength, cvd_confirmed }) {
   const rsiVal = parseFloat(rsi_now);
   const rsiAbs = Math.abs(rsiVal);
   const isBull = signals.overallBull;
@@ -687,10 +715,34 @@ function scoreSignal({ rsi_now, rsi_prev, divergence, timeframe, signals, format
     items: [{ label: `${timeframe} — ${tfLbl}`, pts: tfPts, hit: tfPts >= 12 }]
   };
 
-  const total = conf + rsiPts + divPts + tfPts;
-  const grade = total >= 80 ? 'A' : total >= 65 ? 'B' : total >= 50 ? 'C' : total >= 35 ? 'D' : 'F';
-  const tier  = total >= 80 ? 'PREMIUM' : total >= 65 ? 'STRONG' : total >= 50 ? 'MODERATE' : total >= 35 ? 'WEAK' : 'NOISE';
-  return { total, grade, tier, breakdown, divOpposes };
+  // ── CVD Confirmation (max +15, bonus on top of 100-pt base) ──────────
+  // Treated as a bonus dimension rather than replacing an existing category
+  // so it can push high-conviction aligned signals above 100 → Grade S territory
+  let cvdPts = 0;
+  const cvdItems = [];
+  if (cvd_confirmed) {
+    cvdPts += 10;
+    cvdItems.push({ label: 'CVD gate confirmed (RSI + CVD direction aligned)', pts: 10, hit: true });
+  }
+  if (cvd_bias === 'STRONG_BUY'  && signals.overallBull) { cvdPts += 5; cvdItems.push({ label: 'CVD STRONG_BUY bias matches bull signal', pts: 5, hit: true }); }
+  if (cvd_bias === 'STRONG_SELL' && signals.overallBear)  { cvdPts += 5; cvdItems.push({ label: 'CVD STRONG_SELL bias matches bear signal', pts: 5, hit: true }); }
+  if (cvd_strength !== null && cvd_strength >= 70) { cvdPts += 3; cvdItems.push({ label: `CVD strength ${cvd_strength}/100 (high)`, pts: 3, hit: true }); }
+  // Penalise conflicting CVD
+  if (!cvd_confirmed && cvd_bias && (
+    (signals.overallBull && (cvd_bias === 'STRONG_SELL' || cvd_bias === 'WEAK_SELL')) ||
+    (signals.overallBear && (cvd_bias === 'STRONG_BUY'  || cvd_bias === 'WEAK_BUY'))
+  )) {
+    cvdPts -= 8;
+    cvdItems.push({ label: `CVD bias ${cvd_bias} OPPOSES signal direction`, pts: -8, hit: false, warn: true });
+  }
+  breakdown.cvd = { score: cvdPts, max: 15, items: cvdItems.length ? cvdItems : [{ label: 'No CVD data', pts: 0, hit: false }] };
+
+  const total = conf + rsiPts + divPts + tfPts + Math.max(0, cvdPts); // negative CVD penalty applied below
+  const totalWithPenalty = conf + rsiPts + divPts + tfPts + cvdPts;
+  const finalTotal = totalWithPenalty;
+  const grade = finalTotal >= 80 ? 'A' : finalTotal >= 65 ? 'B' : finalTotal >= 50 ? 'C' : finalTotal >= 35 ? 'D' : 'F';
+  const tier  = finalTotal >= 80 ? 'PREMIUM' : finalTotal >= 65 ? 'STRONG' : finalTotal >= 50 ? 'MODERATE' : finalTotal >= 35 ? 'WEAK' : 'NOISE';
+  return { total: finalTotal, grade, tier, breakdown, divOpposes };
 }
 
 
@@ -771,7 +823,8 @@ function computeCompositeScore(baseScore, marketData, timeCtx, signals) {
 async function runTripleBrainAnalysis(payload, signals, quality, marketData, timeCtx, composite) {
   const { ticker, timeframe, price, high, low, barVolume,
           rsi_now, rsi_prev, divergence, context, liquidity,
-          action, format, harsi_candle, harsi_prev } = payload;
+          action, format, harsi_candle, harsi_prev,
+          cvd, delta, cvd_bias, cvd_strength, cvd_confirmed } = payload;
 
   const isBull      = signals.overallBull;
   const isClose     = action === 'close';
@@ -797,7 +850,11 @@ async function runTripleBrainAnalysis(payload, signals, quality, marketData, tim
   const vannaRisk = atmIV > 30 ? 'HIGH — IV elevated, if IV drops dealers will unhedge, creating headwinds' :
                     atmIV > 20 ? 'MODERATE — IV above normal, monitor for IV crush' :
                     atmIV > 0  ? 'LOW — IV normal, vanna impact minimal' : 'N/A';
-  const vannaGreen = atmIV > 0 && atmIV <= 20 && (isBull ? true : true); // low IV = vanna neutral/helpful
+  // Vanna is helpful for bulls when IV is low (dealers don't need to unhedge)
+  // Vanna is helpful for bears when IV is high (dealer unhedging creates selling pressure)
+  const vannaGreen = isBull
+    ? (atmIV > 0 && atmIV <= 20)   // low IV = vanna neutral/supportive for calls
+    : (atmIV > 20);                 // high IV = dealer unhedging adds selling tailwind for puts
   const charmGreen = timeCtx.charmActive && opts && (
     // Charm is green for bulls when put OI > call OI (dealers buy back short stock hedges)
     isBull ? parseFloat(opts.pcRatio||'0') > 1.0 : parseFloat(opts.pcRatio||'0') < 0.8
@@ -916,6 +973,9 @@ Ticker: ${ticker} | Action: ${actionLabel} | Price: $${price}
 Timeframe: ${timeframe} | RSI: ${rsi_now} (prev: ${rsi_prev}) | HTF Bias: ${payload.htf_bias||'unknown'}
 HARSI: ${harsi_candle} (was ${harsi_prev}) | Divergence: ${divergence||'none'} | OB/OS: ${payload.obos||'neutral'}
 Signal: ${context} | Liquidity Tag: ${liquidity||'N/A'}
+CVD: ${cvd !== null ? `${cvd > 0 ? '+' : ''}${cvd?.toFixed(0)} session | Delta: ${delta > 0 ? '+' : ''}${delta?.toFixed(0)} bar | Bias: ${cvd_bias||'N/A'} | Strength: ${cvd_strength??'N/A'}/100 | Gate: ${cvd_confirmed ? '✅ confirmed' : '⚠ not confirmed'}` : 'CVD data unavailable'}
+${cvd_bias === 'STRONG_BUY'  && !signals.overallBull ? '⚠ CVD STRONG_BUY conflicts with BEAR signal — order flow divergence' : ''}
+${cvd_bias === 'STRONG_SELL' && signals.overallBull  ? '⚠ CVD STRONG_SELL conflicts with BULL signal — order flow divergence' : ''}
 ${payload.htf_bias === 'bearish' && isBull ? '⚠ COUNTER-TREND: BUY signal vs bearish HTF cloud' : ''}
 ${payload.htf_bias === 'bullish' && !isBull && !isClose ? '⚠ COUNTER-TREND: SELL signal vs bullish HTF cloud' : ''}
 
