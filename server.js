@@ -289,6 +289,224 @@ function broadcast(data) {
 const signalHistory = [];
 
 // ══════════════════════════════════════════════════════════════════════════
+//  SYSTEM A — AUTO OUTCOME INFERENCE
+//  On every new signal, resolve the previous ACTIONABLE for the same ticker
+//  by comparing new price vs entry price and direction.  Zero manual input.
+// ══════════════════════════════════════════════════════════════════════════
+function inferOutcome(newPrice, ticker, nowTs) {
+  const prev = signalHistory.find(s =>
+    s.ticker === ticker && s.verdict === 'ACTIONABLE' && !s.outcome && s.price
+  );
+  if (!prev) return;
+
+  const entry   = parseFloat(prev.price);
+  const current = parseFloat(newPrice);
+  const isBull  = prev.signals?.overallBull;
+  const elapsed = (nowTs - prev.ts) / 60000;
+
+  const move    = isBull ? current - entry : entry - current;
+  const movePct = (move / entry) * 100;
+
+  let outcome;
+  if      (elapsed < 3)     outcome = 'SCRATCH';
+  else if (movePct >  0.15) outcome = 'WIN';
+  else if (movePct < -0.15) outcome = 'LOSS';
+  else                       outcome = 'SCRATCH';
+
+  prev.outcome     = outcome;
+  prev.outcomePct  = parseFloat(movePct.toFixed(2));
+  prev.outcomeLbl  = `${movePct >= 0 ? '+' : ''}${movePct.toFixed(2)}% (${elapsed.toFixed(0)}min)`;
+  prev.outcomeAt   = nowTs;
+  prev.elapsedMins = parseFloat(elapsed.toFixed(1));
+
+  broadcast({ type: 'outcome_update', id: prev.id, outcome,
+    outcomePct: prev.outcomePct, outcomeLbl: prev.outcomeLbl, elapsedMins: prev.elapsedMins });
+
+  console.log(`[Outcome] ${ticker} ${isBull ? 'CALL' : 'PUT'} $${entry}->$${current} | ${outcome} | ${prev.outcomeLbl}`);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SYSTEM B — ROLLING PERFORMANCE TRACKER
+// ══════════════════════════════════════════════════════════════════════════
+function getPerformanceContext() {
+  const resolved = signalHistory.filter(s => s.verdict === 'ACTIONABLE' && s.outcome);
+  if (!resolved.length) return null;
+
+  const last10    = resolved.slice(0, 10);
+  const wins      = last10.filter(s => s.outcome === 'WIN').length;
+  const losses    = last10.filter(s => s.outcome === 'LOSS').length;
+  const scratches = last10.filter(s => s.outcome === 'SCRATCH').length;
+  const winRate   = last10.length ? Math.round((wins / last10.length) * 100) : 0;
+
+  let streak = 0, streakType = '';
+  for (const s of resolved) {
+    if (s.outcome === 'SCRATCH') continue;
+    if (!streak) { streakType = s.outcome; streak = 1; }
+    else if (s.outcome === streakType) streak++;
+    else break;
+  }
+
+  const winPcts = resolved.filter(s => s.outcome === 'WIN' && s.outcomePct).map(s => s.outcomePct);
+  const avgWin  = winPcts.length ? (winPcts.reduce((a, b) => a + b, 0) / winPcts.length).toFixed(2) : null;
+
+  const byPhase = {};
+  for (const s of resolved) {
+    const ph = (s.timeCtx?.phase || 'UNKNOWN').split(' ')[0];
+    if (!byPhase[ph]) byPhase[ph] = { wins: 0, total: 0 };
+    byPhase[ph].total++;
+    if (s.outcome === 'WIN') byPhase[ph].wins++;
+  }
+  const bestPhase = Object.entries(byPhase)
+    .filter(([, v]) => v.total >= 2)
+    .sort((a, b) => (b[1].wins / b[1].total) - (a[1].wins / a[1].total))[0];
+
+  const today     = new Date().toISOString().slice(0, 10);
+  const todaySigs = resolved.filter(s => new Date(s.ts).toISOString().slice(0, 10) === today);
+  const todayWins = todaySigs.filter(s => s.outcome === 'WIN').length;
+
+  let sizingRec = 'STANDARD';
+  if (streak >= 4 && streakType === 'LOSS')      sizingRec = 'MINIMUM — 4+ losses, regime may have shifted';
+  else if (streak >= 3 && streakType === 'LOSS') sizingRec = 'REDUCE — 3 consecutive losses';
+  else if (wins >= 7 && last10.length >= 8)      sizingRec = 'FULL — strong recent performance';
+
+  return {
+    total: resolved.length, winRate,
+    last10: { wins, losses, scratches, total: last10.length },
+    streak, streakType, avgWin,
+    bestPhase: bestPhase ? `${bestPhase[0]} (${bestPhase[1].wins}/${bestPhase[1].total})` : null,
+    today: { wins: todayWins, total: todaySigs.length },
+    sizingRec,
+    summary: `${wins}W/${losses}L/${scratches}S last ${last10.length} signals (${winRate}% win rate)`
+      + (streak > 1 ? ` | ${streak} ${streakType} streak` : '')
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SYSTEM C — REGIME CLASSIFIER
+//  TREND / RANGE / EXPANSION / NEUTRAL — adjusts score minimums per regime.
+// ══════════════════════════════════════════════════════════════════════════
+function classifyRegime(marketData, orbCtx) {
+  const vixVal     = parseFloat(marketData?.correlations?.vixVal || '18');
+  const vixChgAbs  = Math.abs(parseFloat(marketData?.correlations?.vixChg || '0'));
+  const qqqChgAbs  = Math.abs(parseFloat((marketData?.quote?.priceChange || '0%').replace('%', '')));
+
+  let orbWidthPct = null;
+  if (orbCtx?.orbHigh && orbCtx?.orbLow) {
+    const mid = (parseFloat(orbCtx.orbHigh) + parseFloat(orbCtx.orbLow)) / 2;
+    orbWidthPct = ((parseFloat(orbCtx.orbHigh) - parseFloat(orbCtx.orbLow)) / mid) * 100;
+  }
+
+  let regime, regimeDetail, minScoreOverride;
+
+  if (vixVal > 28 || vixChgAbs > 5) {
+    regime = 'EXPANSION';
+    regimeDetail = `VIX ${vixVal} — extreme volatility. Puts accelerate; calls fight dealer selling. Only highest conviction.`;
+    minScoreOverride = 90;
+  } else if (vixVal > 20 || qqqChgAbs > 1.2 || (orbWidthPct && orbWidthPct > 0.75)) {
+    regime = 'TREND';
+    regimeDetail = `Directional — VIX ${vixVal}, QQQ ±${qqqChgAbs.toFixed(1)}%. Momentum signals perform well. Ride the move.`;
+    minScoreOverride = 72;
+  } else if (vixVal < 16 || (orbWidthPct !== null && orbWidthPct < 0.3)) {
+    regime = 'RANGE';
+    regimeDetail = `Low VIX (${vixVal}), tight ORB. Chop likely. Fast signals whipsaw. Require higher conviction.`;
+    minScoreOverride = 82;
+  } else {
+    regime = 'NEUTRAL';
+    regimeDetail = `Mixed conditions — VIX ${vixVal}. Standard thresholds apply.`;
+    minScoreOverride = null;
+  }
+
+  const hist     = signalHistory.filter(s => s.regime === regime && s.outcome).slice(0, 10);
+  const histWins = hist.filter(s => s.outcome === 'WIN').length;
+  const regimeWinRate = hist.length >= 2
+    ? `${histWins}/${hist.length} wins in ${regime} regime (historical)` : null;
+
+  return { regime, regimeDetail, minScoreOverride,
+    orbWidthPct: orbWidthPct !== null ? orbWidthPct.toFixed(2) : null, regimeWinRate };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SYSTEM D — DETERMINISTIC STRIKE SELECTOR
+//  Black-Scholes delta-targeting adjusted for time of day and regime.
+// ══════════════════════════════════════════════════════════════════════════
+function selectOptimalStrike(opts, timeCtx, isBull, regime, price) {
+  if (!price) return null;
+  const spot     = parseFloat(price);
+  const rawIV    = parseFloat((opts?.atmIV || '20%').replace('%', ''));
+  const atmIVPct = (isNaN(rawIV) ? 20 : rawIV) / 100;
+  const minLeft  = timeCtx.minutesLeft || 120;
+  const pinLevel = opts?.gexPinLevel ? parseFloat(String(opts.gexPinLevel).replace(/[^0-9.]/g, '')) : null;
+
+  let targetDelta;
+  if      (regime === 'EXPANSION') targetDelta = 0.25;
+  else if (minLeft > 300)          targetDelta = 0.42;
+  else if (minLeft > 180)          targetDelta = 0.36;
+  else if (minLeft > 90)           targetDelta = 0.30;
+  else                             targetDelta = 0.25;
+
+  // Inverse normal approximation
+  const normInv = p => {
+    if (p <= 0.02) return -3.5;
+    if (p >= 0.98) return  3.5;
+    const c = [0.3374754822726147, 0.9761690190917186, 0.1607979714918209,
+               0.0276438810333863, 0.0038405729373609, 0.0003951896511349,
+               0.0000321767881768, 0.0000002888167364, 0.0000003960315187];
+    const r   = Math.sqrt(-2 * Math.log(Math.min(p, 1 - p)));
+    const num = ((((((( c[8]*r+c[7])*r+c[6])*r+c[5])*r+c[4])*r+c[3])*r+c[2])*r+c[1])*r+c[0];
+    return (p < 0.5 ? -1 : 1) * (r - num / (r * num + 1));
+  };
+
+  const T   = Math.max(0.0001, minLeft / (252 * 390));
+  const d1  = normInv(isBull ? targetDelta : 1 - targetDelta);
+  const rawK = spot * Math.exp(-(d1 * atmIVPct * Math.sqrt(T) - 0.5 * atmIVPct * atmIVPct * T));
+  let strike = Math.round(rawK);
+
+  const nearPin = pinLevel && Math.abs(strike - pinLevel) <= 1;
+  if (nearPin) strike = isBull ? Math.round(pinLevel) + 2 : Math.round(pinLevel) - 2;
+
+  strike = Math.round(Math.max(spot * 0.95, Math.min(spot * 1.05, strike)));
+
+  const dist = strike - spot;
+  const dLbl = targetDelta >= 0.40 ? '~0.40d' : targetDelta >= 0.34 ? '~0.35d' : targetDelta >= 0.28 ? '~0.30d' : '~0.25d';
+
+  return {
+    strike, targetDelta, approxDeltaLbl: dLbl,
+    distFromSpot: `${dist >= 0 ? '+' : ''}${dist.toFixed(2)}`,
+    avoidStrike: nearPin ? pinLevel : null,
+    rationale: `${dLbl} for ${minLeft}min left | ${regime} regime${nearPin ? ` | shifted off pin $${pinLevel}` : ''}`
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  SYSTEM E — PRE-FILTER GATE
+//  Hard-blocks AI call on obvious AVOID signals. Saves ~3s latency + cost.
+// ══════════════════════════════════════════════════════════════════════════
+function preFilterSignal(composite, orbCtx, earningsRisk, correlations, timeCtx, regimeCtx) {
+  const reasons = [];
+
+  if (composite.composite < 50)
+    reasons.push(`Score ${composite.composite} below floor (50)`);
+  if (correlations?.vixPanic)
+    reasons.push('VIX panic regime — market chaos, technicals invalid');
+  if (orbCtx?.bullTrap || orbCtx?.bearTrap)
+    reasons.push(`ORB ${orbCtx.bullTrap ? 'bull' : 'bear'} trap — momentum opposes signal`);
+  if (earningsRisk?.risk === 'HIGH')
+    reasons.push('Earnings within 3 days — IV crush risk');
+  if (timeCtx.thetaUrgency === 'CRITICAL' && composite.composite < 80)
+    reasons.push(`Critical theta (${timeCtx.minutesLeft}min left), score ${composite.composite} < 80`);
+  if (regimeCtx?.minScoreOverride && composite.composite < regimeCtx.minScoreOverride)
+    reasons.push(`${regimeCtx.regime} regime requires ${regimeCtx.minScoreOverride}+ (got ${composite.composite})`);
+
+  if (!reasons.length) return { filtered: false };
+
+  return {
+    filtered: true, verdict: 'AVOID', reasons,
+    text: ['DECISION: AVOID', '', 'PRE-FILTER blocked signal:', ...reasons.map(r => '- ' + r), '',
+           'No AI call made. Signal does not meet minimum threshold for current conditions.'].join('\n')
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 //  PHASE 5 — SESSION STRUCTURE STATE
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -1347,7 +1565,7 @@ function computeCompositeScore(baseScore, marketData, timeCtx, signals, orbCtx, 
 // ══════════════════════════════════════════════════════════════════════════
 //  ENGINE 2 — TRIPLE-BRAIN AI PROMPT
 // ══════════════════════════════════════════════════════════════════════════
-async function runTripleBrainAnalysis(payload, signals, quality, marketData, timeCtx, composite, orbCtx, rvolData, earningsRisk) {
+async function runTripleBrainAnalysis(payload, signals, quality, marketData, timeCtx, composite, orbCtx, rvolData, earningsRisk, perfCtx, regimeCtx, strikeRec) {
   const { ticker, timeframe, price, high, low, barVolume,
           rsi_now, rsi_prev, divergence, context, liquidity,
           action, format, harsi_candle, harsi_prev,
@@ -1585,7 +1803,34 @@ Earnings Risk: ${earningsRisk?.message || 'Not checked'}
 Time-weighted min score: ${timeCtx.minScoreFor0DTE}/100 ${timeCtx.requiresHighScore ? '⚠ ELEVATED — after 2:30pm CST' : '(standard)'}
 ${orbCtx?.bullTrap ? '🚨 ORB BULL TRAP DETECTED — BUY below ORB low. AVOID calls.' : ''}
 ${orbCtx?.bearTrap ? '🚨 ORB BEAR TRAP DETECTED — SELL above ORB high. AVOID puts.' : ''}
-${earningsRisk?.risk === 'HIGH' ? '🚨 ' + earningsRisk.message : ''}`;
+${earningsRisk?.risk === 'HIGH' ? '🚨 ' + earningsRisk.message : ''}
+
+MARKET REGIME
+Regime: ${regimeCtx?.regime || 'UNKNOWN'} — ${regimeCtx?.regimeDetail || ''}
+${regimeCtx?.minScoreOverride ? `Regime minimum for ACTIONABLE: ${regimeCtx.minScoreOverride}+` : 'Standard thresholds apply'}
+${regimeCtx?.orbWidthPct ? `ORB width: ${regimeCtx.orbWidthPct}% of price` : ''}
+${regimeCtx?.regimeWinRate || ''}
+
+TRADING PERFORMANCE (last ${perfCtx?.last10?.total || 0} ACTIONABLE signals)
+${perfCtx
+  ? `${perfCtx.summary}
+Today: ${perfCtx.today.wins}W / ${perfCtx.today.total - perfCtx.today.wins}L in ${perfCtx.today.total} signals
+${perfCtx.streak > 1 ? (perfCtx.streakType === 'LOSS'
+    ? `⚠ ${perfCtx.streak} consecutive LOSSES — strategy under stress. ${perfCtx.sizingRec}.`
+    : `✅ ${perfCtx.streak} consecutive WINS — strategy hot. ${perfCtx.sizingRec}.`) : ''}
+${perfCtx.avgWin ? `Avg win move: +${perfCtx.avgWin}%` : ''}
+${perfCtx.bestPhase ? `Best session window: ${perfCtx.bestPhase}` : ''}
+Sizing recommendation: ${perfCtx.sizingRec}`
+  : 'No resolved signals yet — baseline session. Apply standard sizing.'}
+
+DETERMINISTIC STRIKE
+${strikeRec
+  ? `Calculated: $${strikeRec.strike} (${strikeRec.approxDeltaLbl})
+Rationale: ${strikeRec.rationale}
+Distance from spot: ${strikeRec.distFromSpot}
+${strikeRec.avoidStrike ? `AVOID $${strikeRec.avoidStrike} — pin zone` : 'No pin conflict at this strike'}
+Use $${strikeRec.strike} in STRIKE GUIDANCE unless a specific technical level justifies deviation. Explain any deviation.`
+  : 'Strike selector unavailable — use delta/theta judgment'}`;
 
   // ── API CALL WITH STREAMING ────────────────────────────────────────────
   const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1717,9 +1962,38 @@ app.post('/webhook', async (req, res) => {
     const earningsRisk = await checkEarningsRisk(payload.ticker);
 
     const composite = computeCompositeScore(quality.total, marketData, timeCtx, signals, orbCtx, rvolData);
-    const ai        = await runTripleBrainAnalysis(payload, signals, quality, marketData, timeCtx, composite, orbCtx, rvolData, earningsRisk);
 
-    console.log(`[Score] Base: ${quality.total} | Composite: ${composite.composite} | Grade: ${composite.grade}${composite.isGradeS ? ' 🌟 GRADE S' : ''} | Vanna: ${ai.vannaCharmForDash?.vannaRisk?.split(' ')[0]||'N/A'} | Charm: ${timeCtx.charmRisk}`);
+    // ── System A: infer outcome of previous ACTIONABLE signal ────────────
+    inferOutcome(payload.price, payload.ticker, Date.now());
+
+    // ── System B: rolling performance context ────────────────────────────
+    const perfCtx = getPerformanceContext();
+
+    // ── System C: regime classifier ──────────────────────────────────────
+    const regimeCtx = classifyRegime(marketData, orbCtx);
+
+    // ── System E: pre-filter gate (skip AI for obvious AVOIDs) ──────────
+    const preFilter = preFilterSignal(
+      composite, orbCtx, earningsRisk, marketData?.correlations, timeCtx, regimeCtx
+    );
+
+    let ai;
+    if (preFilter.filtered) {
+      console.log(`[PreFilter] BLOCKED — ${preFilter.reasons[0]}`);
+      ai = { text: preFilter.text, verdict: 'AVOID', sizing: 'SKIP',
+             vannaCharmForDash: null, composite, timeCtx };
+    } else {
+      // ── System D: deterministic strike selector ─────────────────────
+      const strikeRec = selectOptimalStrike(
+        marketData?.options, timeCtx, signals.overallBull, regimeCtx.regime, payload.price
+      );
+      ai = await runTripleBrainAnalysis(
+        payload, signals, quality, marketData, timeCtx, composite,
+        orbCtx, rvolData, earningsRisk, perfCtx, regimeCtx, strikeRec
+      );
+    }
+
+    console.log(`[Score] Base: ${quality.total} | Composite: ${composite.composite} | Grade: ${composite.grade}${composite.isGradeS ? ' 🌟 GRADE S' : ''} | Regime: ${regimeCtx.regime} | PreFilter: ${preFilter.filtered}`);
 
     const record = {
       type: 'signal', id: Date.now(),
@@ -1740,12 +2014,14 @@ app.post('/webhook', async (req, res) => {
       timeCtx:   ai.timeCtx,
       vannaCharm: ai.vannaCharmForDash,
       isGradeS:  composite.isGradeS,
-      analysis: ai.text,
-      verdict:  ai.verdict,
-      sizing:   ai.sizing,
-      orbCtx,
-      rvolData,
-      earningsRisk,
+      analysis:  ai.text,
+      verdict:   ai.verdict,
+      sizing:    ai.sizing,
+      orbCtx, rvolData, earningsRisk,
+      regime:       regimeCtx.regime,
+      regimeCtx,
+      perfCtx,
+      preFiltered:  preFilter.filtered,
       ts: Date.now()
     };
 
